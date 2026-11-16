@@ -652,3 +652,83 @@ fn timeout_flag_aborts_a_stalled_request() {
     assert!(!output.status.success());
     assert!(started.elapsed() < std::time::Duration::from_secs(4));
 }
+
+#[test]
+fn timeout_flag_overrides_config_timeout() {
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/api/documents/42/");
+        then.status(200)
+            .delay(std::time::Duration::from_secs(5))
+            .header("content-type", "application/json")
+            .body(r#"{"id":42,"content":"late"}"#);
+    });
+
+    let (_dir, config, session) = base_env();
+    fs::write(
+        &config,
+        format!(
+            "base_url = \"{}\"\ntoken = \"file-token\"\ntimeout = 0\n",
+            server.base_url()
+        ),
+    )
+    .unwrap();
+    let started = std::time::Instant::now();
+    let output = Command::new(env!("CARGO_BIN_EXE_paperless"))
+        .env("PAPERLESS_CONFIG_PATH", &config)
+        .env("PAPERLESS_SESSION_PATH", &session)
+        .env_remove("PAPERLESS_URL")
+        .env_remove("PAPERLESS_TOKEN")
+        .args(["--timeout", "1", "document", "content", "42"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(started.elapsed() < std::time::Duration::from_secs(4));
+}
+
+#[test]
+fn config_commands_and_login_keep_the_timeout_key() {
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/api/status/");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"status":"ok"}"#);
+    });
+
+    let (_dir, config, session) = base_env();
+    fs::write(
+        &config,
+        format!(
+            "base_url = \"{}\"\ntoken = \"file-token\"\ntimeout = 7\n",
+            server.base_url()
+        ),
+    )
+    .unwrap();
+
+    let commands: [&[&str]; 3] = [
+        &["config", "set-url", &server.base_url()],
+        &["config", "set-token", "fresh-token"],
+        &[
+            "login",
+            "--url",
+            &server.base_url(),
+            "--token",
+            "fresh-token",
+        ],
+    ];
+    for args in commands {
+        let output = Command::new(env!("CARGO_BIN_EXE_paperless"))
+            .env("PAPERLESS_CONFIG_PATH", &config)
+            .env("PAPERLESS_SESSION_PATH", &session)
+            .env_remove("PAPERLESS_URL")
+            .env_remove("PAPERLESS_TOKEN")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{args:?} failed");
+        let written = fs::read_to_string(&config).unwrap();
+        assert!(written.contains("timeout = 7"), "{args:?} dropped timeout");
+    }
+}
