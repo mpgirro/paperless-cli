@@ -13,14 +13,14 @@ use paperless_cli::render::render_output;
 use paperless_cli::security::{SecurityAgentProfile, SecurityAuditor};
 use paperless_cli::services::{
     api_passthrough, audit_state, autocomplete_search, bulk_download, bulk_download_zip, bulk_edit,
-    bulk_edit_bodies, connection_info, create_correspondent, create_document_type, create_tag,
+    bulk_operations, connection_info, create_correspondent, create_document_type, create_tag,
     dashboard, delete_correspondent, delete_document, delete_document_type, delete_tag,
     download_document, download_preview, download_thumbnail, edit_document, get_correspondent,
     get_document, get_document_content, get_document_type, get_tag, get_task, init_connection,
     list_correspondents, list_document_types, list_documents, list_tags, list_tasks,
     operational_overview, persist_session, ping, query_search, sanitize_filename, search_documents,
-    status, update_document, update_tag, upload_document, BulkEditRequest, BulkPermissions,
-    DocumentQuery, OutputEnvelope, TagUpdateRequest, UpdateRequest, UploadRequest,
+    status, update_document, update_tag, upload_document, BulkEditRequest, BulkOperation,
+    BulkPermissions, DocumentQuery, OutputEnvelope, TagUpdateRequest, UpdateRequest, UploadRequest,
 };
 use paperless_cli::tui::run_tui;
 use serde_json::{json, Value};
@@ -129,10 +129,11 @@ enum DocumentsCommand {
     Update(DocumentUpdateArgs),
     Delete(IdArgs),
     Search(DocumentSearchArgs),
-    /// Change many documents at once through documents/bulk_edit/.
+    /// Change many documents at once.
     ///
-    /// Sends one request per bulk_edit method, in this order: tags, correspondent,
-    /// document type, permissions, reprocess. Stops at the first failed request.
+    /// Sends one request per operation, in this order: tags, correspondent, document type,
+    /// permissions (all through documents/bulk_edit/), then reprocess (documents/reprocess/).
+    /// Stops at the first failed request.
     Bulk(DocumentBulkArgs),
 }
 
@@ -307,54 +308,55 @@ struct DocumentBulkArgs {
     /// Document type ID, or `none` to clear it.
     #[arg(long = "type", value_name = "ID|none", value_parser = parse_id_or_none)]
     document_type: Option<IdOrNone>,
-    /// Re-run parsing and OCR.
+    /// Re-run parsing and OCR through documents/reprocess/.
     #[arg(long)]
     reprocess: bool,
-    /// Replace owner and permissions with the given ones; omitted lists become empty.
-    #[arg(long, requires = "owner")]
+    /// Set the owner and replace the given permission lists.
+    #[arg(long)]
     set_permissions: bool,
-    /// Owner user ID, or `none` for no owner.
-    #[arg(long, value_name = "ID|none", value_parser = parse_id_or_none, requires = "set_permissions")]
+    /// Owner user ID, or `none` for no owner, which makes the documents visible to all users.
+    #[arg(
+        long,
+        value_name = "ID|none",
+        value_parser = parse_id_or_none,
+        requires = "set_permissions",
+        required_if_eq("set_permissions", "true")
+    )]
     owner: Option<IdOrNone>,
-    /// User IDs that may view, comma-separated.
-    #[arg(
-        long,
-        value_name = "IDS",
-        value_delimiter = ',',
-        requires = "set_permissions"
-    )]
-    view_users: Vec<u64>,
-    /// Group IDs that may view, comma-separated.
-    #[arg(
-        long,
-        value_name = "IDS",
-        value_delimiter = ',',
-        requires = "set_permissions"
-    )]
-    view_groups: Vec<u64>,
-    /// User IDs that may change, comma-separated.
-    #[arg(
-        long,
-        value_name = "IDS",
-        value_delimiter = ',',
-        requires = "set_permissions"
-    )]
-    change_users: Vec<u64>,
-    /// Group IDs that may change, comma-separated.
-    #[arg(
-        long,
-        value_name = "IDS",
-        value_delimiter = ',',
-        requires = "set_permissions"
-    )]
-    change_groups: Vec<u64>,
-    /// Print the request bodies as JSON and send nothing.
+    /// User IDs that may view, comma-separated, or `none` to clear them. Omitted: left unchanged.
+    #[arg(long, value_name = "IDS|none", value_parser = parse_id_list, requires = "set_permissions")]
+    view_users: Option<IdList>,
+    /// Group IDs that may view, comma-separated, or `none` to clear them. Omitted: left unchanged.
+    #[arg(long, value_name = "IDS|none", value_parser = parse_id_list, requires = "set_permissions")]
+    view_groups: Option<IdList>,
+    /// User IDs that may change, comma-separated, or `none` to clear them. Omitted: left unchanged.
+    #[arg(long, value_name = "IDS|none", value_parser = parse_id_list, requires = "set_permissions")]
+    change_users: Option<IdList>,
+    /// Group IDs that may change, comma-separated, or `none` to clear them. Omitted: left unchanged.
+    #[arg(long, value_name = "IDS|none", value_parser = parse_id_list, requires = "set_permissions")]
+    change_groups: Option<IdList>,
+    /// Print the requests (method, path, body) as JSON and send nothing.
     #[arg(long)]
     dry_run: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct IdOrNone(Option<u64>);
+
+#[derive(Clone, Debug)]
+struct IdList(Vec<u64>);
+
+fn parse_id_list(value: &str) -> Result<IdList, String> {
+    if value.eq_ignore_ascii_case("none") {
+        return Ok(IdList(Vec::new()));
+    }
+    value
+        .split(',')
+        .map(|id| id.trim().parse())
+        .collect::<Result<_, _>>()
+        .map(IdList)
+        .map_err(|_| "expected comma-separated IDs or `none`".to_string())
+}
 
 fn parse_id_or_none(value: &str) -> Result<IdOrNone, String> {
     if value.eq_ignore_ascii_case("none") {
@@ -375,16 +377,16 @@ impl DocumentBulkArgs {
             document_type: self.document_type.map(|id| id.0),
             permissions: self.set_permissions.then(|| BulkPermissions {
                 owner: self.owner.and_then(|id| id.0),
-                view_users: self.view_users.clone(),
-                view_groups: self.view_groups.clone(),
-                change_users: self.change_users.clone(),
-                change_groups: self.change_groups.clone(),
+                view_users: self.view_users.clone().map(|ids| ids.0),
+                view_groups: self.view_groups.clone().map(|ids| ids.0),
+                change_users: self.change_users.clone().map(|ids| ids.0),
+                change_groups: self.change_groups.clone().map(|ids| ids.0),
             }),
             reprocess: self.reprocess,
         }
     }
 
-    fn bodies(&self) -> Result<Vec<Value>, AppError> {
+    fn operations(&self) -> Result<Vec<BulkOperation>, AppError> {
         let mut ids = Vec::new();
         for arg in &self.ids {
             if arg == "-" {
@@ -396,7 +398,7 @@ impl DocumentBulkArgs {
                 ids.push(parse_document_id(arg)?);
             }
         }
-        bulk_edit_bodies(&ids, &self.to_request())
+        bulk_operations(&ids, &self.to_request())
     }
 }
 
@@ -563,7 +565,7 @@ fn run() -> Result<(), AppError> {
 
     if let Some(RootCommand::Documents(DocumentsCommand::Bulk(args))) = &cli.command {
         if args.dry_run {
-            let mut bytes = serde_json::to_vec_pretty(&args.bodies()?)?;
+            let mut bytes = serde_json::to_vec_pretty(&args.operations()?)?;
             bytes.push(b'\n');
             io::stdout().write_all(&bytes)?;
             return Ok(());
@@ -822,7 +824,7 @@ fn run_command(
                 DocumentsCommand::Bulk(args) => OutputEnvelope {
                     mode: output_name(output).to_string(),
                     command: "documents bulk".to_string(),
-                    data: bulk_edit(&client, &args.bodies()?)?,
+                    data: bulk_edit(&client, &args.operations()?)?,
                     security: auditor.review_once(&audit_state(paths, Some(&config), None)),
                 },
                 DocumentsCommand::Delete(args) => {
@@ -1253,7 +1255,7 @@ fn run_demo_command(
             DocumentsCommand::Bulk(args) => OutputEnvelope {
                 mode: output_name(output).to_string(),
                 command: "documents bulk".to_string(),
-                data: bulk_edit(&client, &args.bodies()?)?,
+                data: bulk_edit(&client, &args.operations()?)?,
                 security: Vec::new(),
             },
             DocumentsCommand::Delete(args) => {

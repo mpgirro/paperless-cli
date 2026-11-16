@@ -123,7 +123,7 @@ fn dispatch_demo_request(
         (HttpMethod::Get, ["tasks", id]) => item_detail(id, demo_tasks(), normalized),
         (HttpMethod::Get, ["search"]) => search_documents(query),
         (HttpMethod::Get, ["search", "autocomplete"]) => autocomplete(query),
-        (HttpMethod::Post, ["documents", "bulk_edit"]) => {
+        (HttpMethod::Post, ["documents", "bulk_edit" | "reprocess"]) => {
             ok_json(normalized, json!({ "result": "OK" }))
         }
         (HttpMethod::Post, ["documents", "bulk_download"]) => ok_binary(
