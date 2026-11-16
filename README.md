@@ -110,9 +110,11 @@ paperless api PATCH tags/3/ --data @tag.json
 paperless api GET trash/ --all
 ```
 
-`PATH` is relative to `/api/`. The response JSON goes to stdout. A non-2xx
-status exits non-zero with the response body on stderr. `--all` follows `next`
-links of a paginated GET and prints the merged `results` as one array.
+`PATH` is relative to `/api/`; a missing trailing `/` is added. The response
+JSON goes to stdout, a non-JSON body as is. A non-2xx status exits non-zero with
+the response body on stderr. Only GET follows redirects, so a redirected write
+fails instead of turning into a GET. `--all` follows `next` links of a paginated
+GET and prints the merged `results` as one array.
 
 ### Network behavior
 
