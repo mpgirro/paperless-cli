@@ -89,7 +89,7 @@ For fast iteration on layout and keyboard behavior, use `paperless --demo`.
 | `config` | `set-url`, `set-token` |
 | `pdf` | `read`, `info` |
 | `project` | `login`, `info`, `ping` |
-| `document` | `list`, `get`, `content`, `upload`, `download`, `preview`, `thumb`, `edit`, `update`, `delete`, `search` |
+| `document` | `list`, `get`, `content`, `upload`, `download`, `preview`, `thumb`, `edit`, `update`, `delete`, `search`, `bulk` |
 | `search` | `query`, `autocomplete` |
 | `task` | `list`, `get` |
 | `tag` | `list`, `get`, `create`, `edit`, `delete` |
@@ -110,6 +110,25 @@ its value flag.
 paperless document update 42 --storage-path-id 3 --tag-id 1 --tag-id 2
 paperless document update 42 --no-correspondent --no-tags
 ```
+
+### Bulk edits
+
+`document bulk` changes many documents through `documents/bulk_edit/`. It sends
+one request per method, in this order: tags (`add_tag`, `remove_tag`, or one
+`modify_tags` when several tags change), `set_correspondent`,
+`set_document_type`, `set_permissions`, `reprocess`. It stops at the first
+failed request and names the methods already applied. `-` reads IDs from stdin.
+`--dry-run` prints the request bodies and sends nothing.
+
+```sh
+paperless document bulk 1 2 3 --add-tag 5 --remove-tag 7
+paperless document bulk 1 2 --correspondent none --type 4
+paperless document list --json | jq '.data.results[].id' | paperless document bulk - --reprocess
+paperless document bulk 1 --set-permissions --owner 2 --view-groups 3,4 --dry-run
+```
+
+`--set-permissions` replaces owner and permissions, so it needs `--owner`
+(`none` for no owner); lists not given become empty.
 
 ### Raw API calls
 

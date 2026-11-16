@@ -109,6 +109,26 @@ pub struct UpdateRequest {
     pub custom_fields: Option<Value>,
 }
 
+/// Operations for `documents/bulk_edit/`. `Some(None)` clears the field.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BulkEditRequest {
+    pub add_tags: Vec<u64>,
+    pub remove_tags: Vec<u64>,
+    pub correspondent: Option<Option<u64>>,
+    pub document_type: Option<Option<u64>>,
+    pub permissions: Option<BulkPermissions>,
+    pub reprocess: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BulkPermissions {
+    pub owner: Option<u64>,
+    pub view_users: Vec<u64>,
+    pub view_groups: Vec<u64>,
+    pub change_users: Vec<u64>,
+    pub change_groups: Vec<u64>,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TagUpdateRequest {
     pub name: Option<String>,
@@ -617,6 +637,88 @@ pub fn bulk_download_zip<T: Transport>(
     download_to_file(client, request, &part_path)?;
     finish_part(&part_path, output_path)?;
     Ok(output_path.to_path_buf())
+}
+
+/// One `bulk_edit` body per method, in the order tags, correspondent, document type,
+/// permissions, reprocess.
+pub fn bulk_edit_bodies(
+    document_ids: &[u64],
+    request: &BulkEditRequest,
+) -> Result<Vec<Value>, AppError> {
+    if document_ids.is_empty() {
+        return Err(AppError::Message("No document IDs given.".to_string()));
+    }
+    let mut operations = Vec::new();
+    match (request.add_tags.as_slice(), request.remove_tags.as_slice()) {
+        ([], []) => {}
+        ([tag], []) => operations.push(("add_tag", json!({ "tag": tag }))),
+        ([], [tag]) => operations.push(("remove_tag", json!({ "tag": tag }))),
+        (add, remove) => operations.push((
+            "modify_tags",
+            json!({ "add_tags": add, "remove_tags": remove }),
+        )),
+    }
+    if let Some(correspondent) = request.correspondent {
+        operations.push((
+            "set_correspondent",
+            json!({ "correspondent": correspondent }),
+        ));
+    }
+    if let Some(document_type) = request.document_type {
+        operations.push((
+            "set_document_type",
+            json!({ "document_type": document_type }),
+        ));
+    }
+    if let Some(permissions) = &request.permissions {
+        operations.push((
+            "set_permissions",
+            json!({
+                "set_permissions": {
+                    "view": {"users": permissions.view_users, "groups": permissions.view_groups},
+                    "change": {"users": permissions.change_users, "groups": permissions.change_groups},
+                },
+                "owner": permissions.owner,
+                "merge": false,
+            }),
+        ));
+    }
+    if request.reprocess {
+        operations.push(("reprocess", json!({})));
+    }
+    if operations.is_empty() {
+        return Err(AppError::Message("No bulk operation given.".to_string()));
+    }
+    Ok(operations
+        .into_iter()
+        .map(|(method, parameters)| {
+            json!({ "documents": document_ids, "method": method, "parameters": parameters })
+        })
+        .collect())
+}
+
+/// Sends each body in turn and stops at the first failure.
+pub fn bulk_edit<T: Transport>(client: &ApiClient<T>, bodies: &[Value]) -> Result<Value, AppError> {
+    let mut applied: Vec<&str> = Vec::new();
+    let mut results = Vec::new();
+    for body in bodies {
+        let method = body["method"].as_str().unwrap_or_default();
+        let response = client
+            .post_json("documents/bulk_edit/", body.clone())
+            .map_err(|error| {
+                let applied = if applied.is_empty() {
+                    "none".to_string()
+                } else {
+                    applied.join(", ")
+                };
+                AppError::Message(format!(
+                    "bulk_edit {method} failed (already applied: {applied}): {error}"
+                ))
+            })?;
+        applied.push(method);
+        results.push(json!({ "method": method, "response": response }));
+    }
+    Ok(Value::Array(results))
 }
 
 /// Raw call for `paperless api`; returns the bytes to print. With `all`, a GET follows

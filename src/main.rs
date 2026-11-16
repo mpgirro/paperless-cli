@@ -12,15 +12,15 @@ use paperless_cli::pdf::{read_local_pdf_info, read_local_pdf_text};
 use paperless_cli::render::render_output;
 use paperless_cli::security::{SecurityAgentProfile, SecurityAuditor};
 use paperless_cli::services::{
-    api_passthrough, audit_state, autocomplete_search, bulk_download, bulk_download_zip,
-    connection_info, create_correspondent, create_document_type, create_tag, dashboard,
-    delete_correspondent, delete_document, delete_document_type, delete_tag, download_document,
-    download_preview, download_thumbnail, edit_document, get_correspondent, get_document,
-    get_document_content, get_document_type, get_tag, get_task, init_connection,
+    api_passthrough, audit_state, autocomplete_search, bulk_download, bulk_download_zip, bulk_edit,
+    bulk_edit_bodies, connection_info, create_correspondent, create_document_type, create_tag,
+    dashboard, delete_correspondent, delete_document, delete_document_type, delete_tag,
+    download_document, download_preview, download_thumbnail, edit_document, get_correspondent,
+    get_document, get_document_content, get_document_type, get_tag, get_task, init_connection,
     list_correspondents, list_document_types, list_documents, list_tags, list_tasks,
     operational_overview, persist_session, ping, query_search, sanitize_filename, search_documents,
-    status, update_document, update_tag, upload_document, DocumentQuery, OutputEnvelope,
-    TagUpdateRequest, UpdateRequest, UploadRequest,
+    status, update_document, update_tag, upload_document, BulkEditRequest, BulkPermissions,
+    DocumentQuery, OutputEnvelope, TagUpdateRequest, UpdateRequest, UploadRequest,
 };
 use paperless_cli::tui::run_tui;
 use serde_json::{json, Value};
@@ -129,6 +129,11 @@ enum DocumentsCommand {
     Update(DocumentUpdateArgs),
     Delete(IdArgs),
     Search(DocumentSearchArgs),
+    /// Change many documents at once through documents/bulk_edit/.
+    ///
+    /// Sends one request per bulk_edit method, in this order: tags, correspondent,
+    /// document type, permissions, reprocess. Stops at the first failed request.
+    Bulk(DocumentBulkArgs),
 }
 
 #[derive(Args, Debug)]
@@ -285,6 +290,122 @@ impl DocumentEditArgs {
     }
 }
 
+#[derive(Args, Debug)]
+struct DocumentBulkArgs {
+    /// Document IDs; `-` reads whitespace-separated IDs from stdin.
+    #[arg(required = true)]
+    ids: Vec<String>,
+    /// Tag ID to add, repeatable.
+    #[arg(long = "add-tag", value_name = "ID")]
+    add_tags: Vec<u64>,
+    /// Tag ID to remove, repeatable.
+    #[arg(long = "remove-tag", value_name = "ID")]
+    remove_tags: Vec<u64>,
+    /// Correspondent ID, or `none` to clear it.
+    #[arg(long, value_name = "ID|none", value_parser = parse_id_or_none)]
+    correspondent: Option<IdOrNone>,
+    /// Document type ID, or `none` to clear it.
+    #[arg(long = "type", value_name = "ID|none", value_parser = parse_id_or_none)]
+    document_type: Option<IdOrNone>,
+    /// Re-run parsing and OCR.
+    #[arg(long)]
+    reprocess: bool,
+    /// Replace owner and permissions with the given ones; omitted lists become empty.
+    #[arg(long, requires = "owner")]
+    set_permissions: bool,
+    /// Owner user ID, or `none` for no owner.
+    #[arg(long, value_name = "ID|none", value_parser = parse_id_or_none, requires = "set_permissions")]
+    owner: Option<IdOrNone>,
+    /// User IDs that may view, comma-separated.
+    #[arg(
+        long,
+        value_name = "IDS",
+        value_delimiter = ',',
+        requires = "set_permissions"
+    )]
+    view_users: Vec<u64>,
+    /// Group IDs that may view, comma-separated.
+    #[arg(
+        long,
+        value_name = "IDS",
+        value_delimiter = ',',
+        requires = "set_permissions"
+    )]
+    view_groups: Vec<u64>,
+    /// User IDs that may change, comma-separated.
+    #[arg(
+        long,
+        value_name = "IDS",
+        value_delimiter = ',',
+        requires = "set_permissions"
+    )]
+    change_users: Vec<u64>,
+    /// Group IDs that may change, comma-separated.
+    #[arg(
+        long,
+        value_name = "IDS",
+        value_delimiter = ',',
+        requires = "set_permissions"
+    )]
+    change_groups: Vec<u64>,
+    /// Print the request bodies as JSON and send nothing.
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct IdOrNone(Option<u64>);
+
+fn parse_id_or_none(value: &str) -> Result<IdOrNone, String> {
+    if value.eq_ignore_ascii_case("none") {
+        return Ok(IdOrNone(None));
+    }
+    value
+        .parse()
+        .map(|id| IdOrNone(Some(id)))
+        .map_err(|_| "expected an ID or `none`".to_string())
+}
+
+impl DocumentBulkArgs {
+    fn to_request(&self) -> BulkEditRequest {
+        BulkEditRequest {
+            add_tags: self.add_tags.clone(),
+            remove_tags: self.remove_tags.clone(),
+            correspondent: self.correspondent.map(|id| id.0),
+            document_type: self.document_type.map(|id| id.0),
+            permissions: self.set_permissions.then(|| BulkPermissions {
+                owner: self.owner.and_then(|id| id.0),
+                view_users: self.view_users.clone(),
+                view_groups: self.view_groups.clone(),
+                change_users: self.change_users.clone(),
+                change_groups: self.change_groups.clone(),
+            }),
+            reprocess: self.reprocess,
+        }
+    }
+
+    fn bodies(&self) -> Result<Vec<Value>, AppError> {
+        let mut ids = Vec::new();
+        for arg in &self.ids {
+            if arg == "-" {
+                let input = io::read_to_string(io::stdin())?;
+                for token in input.split_whitespace() {
+                    ids.push(parse_document_id(token)?);
+                }
+            } else {
+                ids.push(parse_document_id(arg)?);
+            }
+        }
+        bulk_edit_bodies(&ids, &self.to_request())
+    }
+}
+
+fn parse_document_id(value: &str) -> Result<u64, AppError> {
+    value
+        .parse()
+        .map_err(|_| AppError::Message(format!("Invalid document ID: {value}")))
+}
+
 fn clearable(value: Option<u64>, clear: bool) -> Option<Option<u64>> {
     if clear {
         Some(None)
@@ -439,6 +560,15 @@ fn run() -> Result<(), AppError> {
     } else {
         cli.output
     };
+
+    if let Some(RootCommand::Documents(DocumentsCommand::Bulk(args))) = &cli.command {
+        if args.dry_run {
+            let mut bytes = serde_json::to_vec_pretty(&args.bodies()?)?;
+            bytes.push(b'\n');
+            io::stdout().write_all(&bytes)?;
+            return Ok(());
+        }
+    }
 
     if cli.demo {
         return match cli.command {
@@ -687,6 +817,12 @@ fn run_command(
                     mode: output_name(output).to_string(),
                     command: "documents update".to_string(),
                     data: update_document(&client, args.id, &args.to_request())?,
+                    security: auditor.review_once(&audit_state(paths, Some(&config), None)),
+                },
+                DocumentsCommand::Bulk(args) => OutputEnvelope {
+                    mode: output_name(output).to_string(),
+                    command: "documents bulk".to_string(),
+                    data: bulk_edit(&client, &args.bodies()?)?,
                     security: auditor.review_once(&audit_state(paths, Some(&config), None)),
                 },
                 DocumentsCommand::Delete(args) => {
@@ -1114,6 +1250,12 @@ fn run_demo_command(
                 data: update_document(&client, args.id, &args.to_request())?,
                 security: Vec::new(),
             },
+            DocumentsCommand::Bulk(args) => OutputEnvelope {
+                mode: output_name(output).to_string(),
+                command: "documents bulk".to_string(),
+                data: bulk_edit(&client, &args.bodies()?)?,
+                security: Vec::new(),
+            },
             DocumentsCommand::Delete(args) => {
                 delete_document(&client, args.id)?;
                 OutputEnvelope {
@@ -1397,6 +1539,7 @@ fn suppressible_command(command: &str, output: OutputMode) -> bool {
             | "documents thumb"
             | "documents edit"
             | "documents update"
+            | "documents bulk"
             | "documents delete"
             | "tags create"
             | "tags edit"
