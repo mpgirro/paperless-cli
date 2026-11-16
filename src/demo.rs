@@ -123,6 +123,9 @@ fn dispatch_demo_request(
         (HttpMethod::Get, ["tasks", id]) => item_detail(id, demo_tasks(), normalized),
         (HttpMethod::Get, ["search"]) => search_documents(query),
         (HttpMethod::Get, ["search", "autocomplete"]) => autocomplete(query),
+        (HttpMethod::Post, ["documents", "bulk_edit"]) => {
+            ok_json(normalized, json!({ "result": "OK" }))
+        }
         (HttpMethod::Post, ["documents", "bulk_download"]) => ok_binary(
             normalized,
             vec![0x50, 0x4b, 0x03, 0x04, b'D', b'E', b'M', b'O'],
