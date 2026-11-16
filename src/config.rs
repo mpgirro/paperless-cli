@@ -2,6 +2,7 @@ use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
@@ -24,7 +25,12 @@ pub struct AppConfig {
     pub token: String,
     #[serde(default)]
     pub preferred_output: OutputMode,
+    /// HTTP timeout in seconds; `None` means the default, `0` means no timeout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u64>,
 }
+
+pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
 impl fmt::Debug for AppConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -33,6 +39,7 @@ impl fmt::Debug for AppConfig {
             .field("base_url", &self.base_url)
             .field("token", &self.masked_token())
             .field("preferred_output", &self.preferred_output)
+            .field("timeout", &self.timeout)
             .finish()
     }
 }
@@ -53,7 +60,15 @@ impl AppConfig {
             base_url,
             token,
             preferred_output,
+            timeout: None,
         })
+    }
+
+    pub fn http_timeout(&self) -> Option<Duration> {
+        match self.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS) {
+            0 => None,
+            secs => Some(Duration::from_secs(secs)),
+        }
     }
 
     pub fn api_url(&self, path: &str) -> String {
@@ -176,9 +191,11 @@ pub fn load_config(paths: &AppPaths) -> Result<AppConfig, AppError> {
         .as_ref()
         .map(|config| config.preferred_output)
         .unwrap_or_default();
+    let timeout = persisted.as_ref().and_then(|config| config.timeout);
 
     match (base_url, token) {
-        (Some(base_url), Some(token)) => AppConfig::new(base_url, token, preferred_output),
+        (Some(base_url), Some(token)) => AppConfig::new(base_url, token, preferred_output)
+            .map(|config| AppConfig { timeout, ..config }),
         (None, None) => Err(AppError::ConfigMissing),
         _ => Err(AppError::Message(
             "Missing Paperless configuration. Set both `PAPERLESS_URL` and `PAPERLESS_TOKEN`, or run `paperless login`.".to_string(),
@@ -286,6 +303,7 @@ impl From<LegacyConfig> for AppConfig {
             base_url: value.url.trim_end_matches('/').to_string(),
             token: value.token,
             preferred_output: OutputMode::Markdown,
+            timeout: None,
         }
     }
 }

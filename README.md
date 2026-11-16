@@ -56,6 +56,15 @@ paperless status
 paperless dashboard
 ```
 
+Set the HTTP timeout in seconds with `--timeout` or a `timeout` key in the
+config file. The default is 30; `0` disables it. Downloads stream to disk and
+fail only when the server stops sending data for that long. Uploads use the
+timeout only for connecting:
+
+```bash
+paperless --timeout 120 document upload scan.pdf
+```
+
 ## TUI overview
 
 The default TUI is a two-pane document browser:

@@ -42,6 +42,9 @@ struct Cli {
     no_color: bool,
     #[arg(short = 'u', long, global = true)]
     url: Option<String>,
+    /// HTTP timeout in seconds (default 30, 0 disables it). Uploads use it only for connecting.
+    #[arg(long, global = true, value_name = "SECS")]
+    timeout: Option<u64>,
     #[arg(long, global = true, default_value_t = false)]
     demo: bool,
     #[command(subcommand)]
@@ -362,18 +365,22 @@ fn run() -> Result<(), AppError> {
         };
     }
 
+    let overrides = Overrides {
+        url: cli.url.as_deref(),
+        timeout: cli.timeout,
+    };
     match cli.command {
-        None => run_interactive(&paths, cli.url.as_deref(), cli.no_color),
-        Some(command) => run_command(command, output, &paths, cli.url.as_deref(), cli.quiet),
+        None => run_interactive(&paths, overrides, cli.no_color),
+        Some(command) => run_command(command, output, &paths, overrides, cli.quiet),
     }
 }
 
 fn run_interactive(
     paths: &AppPaths,
-    url_override: Option<&str>,
+    overrides: Overrides,
     _no_color: bool,
 ) -> Result<(), AppError> {
-    let config = load_config_with_override(paths, url_override)?;
+    let config = load_config_with_override(paths, overrides)?;
     let transport = ReqwestTransport::new(config.clone())?;
     let client = ApiClient::new(transport);
     let auditor = SecurityAuditor::new(
@@ -399,18 +406,22 @@ fn run_command(
     command: RootCommand,
     output: OutputMode,
     paths: &AppPaths,
-    url_override: Option<&str>,
+    overrides: Overrides,
     quiet: bool,
 ) -> Result<(), AppError> {
     let security_profile = SecurityAgentProfile::security_reviewer();
     let auditor = SecurityAuditor::new(security_profile, Duration::from_secs(60));
 
     let envelope = match command {
-        RootCommand::Login(args) => login_envelope(args, output, paths, &auditor)?,
+        RootCommand::Login(args) => {
+            login_envelope(args, output, paths, overrides.timeout, &auditor)?
+        }
         RootCommand::Project(project_command) => match project_command {
-            ProjectCommand::Login(args) => login_envelope(args, output, paths, &auditor)?,
+            ProjectCommand::Login(args) => {
+                login_envelope(args, output, paths, overrides.timeout, &auditor)?
+            }
             ProjectCommand::Info => {
-                let config = load_config_with_override(paths, url_override)?;
+                let config = load_config_with_override(paths, overrides)?;
                 let client = client_for_config(&config)?;
                 let findings = auditor.review_once(&audit_state(paths, Some(&config), None));
                 OutputEnvelope {
@@ -421,7 +432,7 @@ fn run_command(
                 }
             }
             ProjectCommand::Ping => {
-                let config = load_config_with_override(paths, url_override)?;
+                let config = load_config_with_override(paths, overrides)?;
                 let client = client_for_config(&config)?;
                 let findings = auditor.review_once(&audit_state(paths, Some(&config), None));
                 OutputEnvelope {
@@ -481,7 +492,7 @@ fn run_command(
             },
         },
         RootCommand::Documents(documents_command) => {
-            let config = load_config_with_override(paths, url_override)?;
+            let config = load_config_with_override(paths, overrides)?;
             let client = client_for_config(&config)?;
             let mut session = paperless_cli::config::load_session(paths);
             let envelope = match documents_command {
@@ -646,7 +657,7 @@ fn run_command(
             envelope
         }
         RootCommand::Search(search_command) => {
-            let config = load_config_with_override(paths, url_override)?;
+            let config = load_config_with_override(paths, overrides)?;
             let client = client_for_config(&config)?;
             match search_command {
                 SearchCommand::Query(args) => OutputEnvelope {
@@ -664,7 +675,7 @@ fn run_command(
             }
         }
         RootCommand::Tasks(tasks_command) => {
-            let config = load_config_with_override(paths, url_override)?;
+            let config = load_config_with_override(paths, overrides)?;
             let client = client_for_config(&config)?;
             match tasks_command {
                 TasksCommand::List => OutputEnvelope {
@@ -682,7 +693,7 @@ fn run_command(
             }
         }
         RootCommand::Tags(tag_command) => {
-            let config = load_config_with_override(paths, url_override)?;
+            let config = load_config_with_override(paths, overrides)?;
             let client = client_for_config(&config)?;
             match tag_command {
                 TagsCommand::List => OutputEnvelope {
@@ -732,7 +743,7 @@ fn run_command(
             }
         }
         RootCommand::Correspondents(command) => {
-            let config = load_config_with_override(paths, url_override)?;
+            let config = load_config_with_override(paths, overrides)?;
             let client = client_for_config(&config)?;
             match command {
                 CorrespondentsCommand::List => OutputEnvelope {
@@ -768,7 +779,7 @@ fn run_command(
             }
         }
         RootCommand::DocumentTypes(command) => {
-            let config = load_config_with_override(paths, url_override)?;
+            let config = load_config_with_override(paths, overrides)?;
             let client = client_for_config(&config)?;
             match command {
                 DocumentTypesCommand::List => OutputEnvelope {
@@ -804,7 +815,7 @@ fn run_command(
             }
         }
         RootCommand::Export(ExportCommand::Bulk(args)) => {
-            let config = load_config_with_override(paths, url_override)?;
+            let config = load_config_with_override(paths, overrides)?;
             let client = client_for_config(&config)?;
             let data = if args.zip {
                 let archive_path = args
@@ -827,7 +838,7 @@ fn run_command(
             }
         }
         RootCommand::Dashboard => {
-            let config = load_config_with_override(paths, url_override)?;
+            let config = load_config_with_override(paths, overrides)?;
             let client = client_for_config(&config)?;
             OutputEnvelope {
                 mode: output_name(output).to_string(),
@@ -838,11 +849,7 @@ fn run_command(
         }
         RootCommand::Status => match load_config(paths) {
             Ok(config) => {
-                let config = if let Some(url) = url_override {
-                    config_with_url_override(config, url)?
-                } else {
-                    config
-                };
+                let config = apply_overrides(config, overrides)?;
                 let client = client_for_config(&config)?;
                 OutputEnvelope {
                     mode: output_name(output).to_string(),
@@ -1274,18 +1281,24 @@ fn client_for_config(config: &AppConfig) -> Result<ApiClient<ReqwestTransport>, 
 
 fn load_config_with_override(
     paths: &AppPaths,
-    url_override: Option<&str>,
+    overrides: Overrides,
 ) -> Result<AppConfig, AppError> {
-    let config = load_config(paths)?;
-    if let Some(url) = url_override {
-        config_with_url_override(config, url)
-    } else {
-        Ok(config)
-    }
+    apply_overrides(load_config(paths)?, overrides)
 }
 
-fn config_with_url_override(config: AppConfig, url: &str) -> Result<AppConfig, AppError> {
-    AppConfig::new(url, config.token, config.preferred_output)
+#[derive(Clone, Copy)]
+struct Overrides<'a> {
+    url: Option<&'a str>,
+    timeout: Option<u64>,
+}
+
+fn apply_overrides(config: AppConfig, overrides: Overrides) -> Result<AppConfig, AppError> {
+    let timeout = overrides.timeout.or(config.timeout);
+    let config = match overrides.url {
+        Some(url) => AppConfig::new(url, config.token, config.preferred_output)?,
+        None => config,
+    };
+    Ok(AppConfig { timeout, ..config })
 }
 
 fn suppressible_command(command: &str, output: OutputMode) -> bool {
@@ -1331,7 +1344,10 @@ fn set_config_url(paths: &AppPaths, url: String) -> Result<AppConfig, AppError> 
         .as_ref()
         .map(|config| config.preferred_output)
         .unwrap_or_default();
-    let config = AppConfig::new(url, token, preferred_output)?;
+    let config = AppConfig {
+        timeout: existing.and_then(|config| config.timeout),
+        ..AppConfig::new(url, token, preferred_output)?
+    };
     save_config(paths, &config)?;
     Ok(config)
 }
@@ -1351,7 +1367,10 @@ fn set_config_token(paths: &AppPaths, token: String) -> Result<AppConfig, AppErr
         .as_ref()
         .map(|config| config.preferred_output)
         .unwrap_or_default();
-    let config = AppConfig::new(url, token, preferred_output)?;
+    let config = AppConfig {
+        timeout: existing.and_then(|config| config.timeout),
+        ..AppConfig::new(url, token, preferred_output)?
+    };
     save_config(paths, &config)?;
     Ok(config)
 }
@@ -1360,11 +1379,15 @@ fn login_envelope(
     args: LoginArgs,
     output: OutputMode,
     paths: &AppPaths,
+    timeout: Option<u64>,
     auditor: &SecurityAuditor,
 ) -> Result<OutputEnvelope, AppError> {
     let login = resolve_login_args(args)?;
     let config = init_connection(
-        |config| ReqwestTransport::new(config.clone()).map(ApiClient::new),
+        |config| {
+            let timeout = timeout.or(config.timeout);
+            ReqwestTransport::new(AppConfig { timeout, ..config }).map(ApiClient::new)
+        },
         paths,
         &login.url,
         login.token,
