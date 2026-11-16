@@ -97,6 +97,20 @@ For fast iteration on layout and keyboard behavior, use `paperless --demo`.
 | `doctype` | `list`, `get`, `create`, `delete` |
 | `export` | `bulk` |
 
+### Updating documents
+
+`document update` and `document edit` set fields with `--title`,
+`--correspondent-id`, `--type-id`, `--storage-path-id` and `--created`.
+`update` replaces tags with `--tag-id`; `edit` adds and removes tags with
+`--add-tag` and `--remove-tag`. Clear a field with `--no-correspondent`,
+`--no-type`, `--no-storage-path` or `--no-tags`. Each clear flag conflicts with
+its value flag.
+
+```sh
+paperless document update 42 --storage-path-id 3 --tag-id 1 --tag-id 2
+paperless document update 42 --no-correspondent --no-tags
+```
+
 ### Raw API calls
 
 `paperless api` reaches endpoints the CLI does not wrap, with the stored URL and

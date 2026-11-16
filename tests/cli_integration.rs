@@ -1,7 +1,7 @@
 use std::fs;
 use std::process::Command;
 
-use httpmock::Method::{GET, POST};
+use httpmock::Method::{GET, PATCH, POST};
 use httpmock::MockServer;
 use tempfile::tempdir;
 
@@ -731,4 +731,142 @@ fn config_commands_and_login_keep_the_timeout_key() {
         let written = fs::read_to_string(&config).unwrap();
         assert!(written.contains("timeout = 7"), "{args:?} dropped timeout");
     }
+}
+
+fn run_with_server(server: &MockServer, args: &[&str]) -> std::process::Output {
+    let (_dir, config, session) = base_env();
+    Command::new(env!("CARGO_BIN_EXE_paperless"))
+        .env("PAPERLESS_CONFIG_PATH", &config)
+        .env("PAPERLESS_SESSION_PATH", &session)
+        .env("PAPERLESS_URL", server.base_url())
+        .env("PAPERLESS_TOKEN", "env-token")
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn document_update_no_flags_send_null_and_empty_tags() {
+    let server = MockServer::start();
+    let patch = server.mock(|when, then| {
+        when.method(PATCH)
+            .path("/api/documents/42/")
+            .json_body(serde_json::json!({
+                "correspondent": null,
+                "document_type": null,
+                "storage_path": null,
+                "tags": [],
+            }));
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"id":42}"#);
+    });
+
+    let output = run_with_server(
+        &server,
+        &[
+            "--json",
+            "document",
+            "update",
+            "42",
+            "--no-correspondent",
+            "--no-type",
+            "--no-tags",
+            "--no-storage-path",
+        ],
+    );
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    patch.assert();
+}
+
+#[test]
+fn document_update_sets_storage_path() {
+    let server = MockServer::start();
+    let patch = server.mock(|when, then| {
+        when.method(PATCH)
+            .path("/api/documents/42/")
+            .json_body(serde_json::json!({"storage_path": 7, "tags": [1, 2]}));
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"id":42}"#);
+    });
+
+    let output = run_with_server(
+        &server,
+        &[
+            "--json",
+            "document",
+            "update",
+            "42",
+            "--storage-path-id",
+            "7",
+            "--tag-id",
+            "1",
+            "--tag-id",
+            "2",
+        ],
+    );
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    patch.assert();
+}
+
+#[test]
+fn document_edit_no_correspondent_sends_null() {
+    let server = MockServer::start();
+    let patch = server.mock(|when, then| {
+        when.method(PATCH)
+            .path("/api/documents/42/")
+            .json_body(serde_json::json!({"correspondent": null}));
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"id":42}"#);
+    });
+
+    let output = run_with_server(
+        &server,
+        &["--json", "document", "edit", "42", "--no-correspondent"],
+    );
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    patch.assert();
+}
+
+#[test]
+fn document_update_rejects_value_and_clear_flag_together() {
+    let server = MockServer::start();
+    let any = server.mock(|_, then| {
+        then.status(500);
+    });
+    for args in [
+        ["--correspondent-id", "3", "--no-correspondent"],
+        ["--type-id", "3", "--no-type"],
+        ["--tag-id", "3", "--no-tags"],
+        ["--storage-path-id", "3", "--no-storage-path"],
+    ] {
+        let mut full = vec!["document", "update", "42"];
+        full.extend(args);
+        let output = run_with_server(&server, &full);
+        assert!(!output.status.success(), "{args:?} was accepted");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("cannot be used with"));
+    }
+    let output = run_with_server(
+        &server,
+        &["document", "edit", "42", "--add-tag", "a", "--no-tags"],
+    );
+    assert!(!output.status.success());
+    any.assert_calls(0);
 }
