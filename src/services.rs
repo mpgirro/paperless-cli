@@ -100,8 +100,10 @@ pub struct UploadRequest {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct UpdateRequest {
     pub title: Option<String>,
-    pub correspondent_id: Option<u64>,
-    pub document_type_id: Option<u64>,
+    /// On the `Option<Option<u64>>` fields, `Some(None)` sends `null` to clear the field.
+    pub correspondent_id: Option<Option<u64>>,
+    pub document_type_id: Option<Option<u64>>,
+    pub storage_path_id: Option<Option<u64>>,
     pub tag_ids: Option<Vec<u64>>,
     pub created: Option<String>,
     pub custom_fields: Option<Value>,
@@ -320,6 +322,9 @@ pub fn update_document<T: Transport>(
     }
     if let Some(document_type_id) = request.document_type_id {
         patch.insert("document_type".to_string(), json!(document_type_id));
+    }
+    if let Some(storage_path_id) = request.storage_path_id {
+        patch.insert("storage_path".to_string(), json!(storage_path_id));
     }
     if let Some(tag_ids) = &request.tag_ids {
         patch.insert("tags".to_string(), json!(tag_ids));

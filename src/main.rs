@@ -206,12 +206,42 @@ struct DocumentUpdateArgs {
     title: Option<String>,
     #[arg(long)]
     correspondent_id: Option<u64>,
+    #[arg(long, conflicts_with = "correspondent_id")]
+    no_correspondent: bool,
     #[arg(long)]
     type_id: Option<u64>,
+    #[arg(long, conflicts_with = "type_id")]
+    no_type: bool,
+    #[arg(long)]
+    storage_path_id: Option<u64>,
+    #[arg(long, conflicts_with = "storage_path_id")]
+    no_storage_path: bool,
     #[arg(long = "tag-id")]
     tag_ids: Vec<u64>,
+    #[arg(long, conflicts_with = "tag_ids")]
+    no_tags: bool,
     #[arg(long)]
     created: Option<String>,
+}
+
+impl DocumentUpdateArgs {
+    fn to_request(&self) -> UpdateRequest {
+        UpdateRequest {
+            title: self.title.clone(),
+            correspondent_id: clearable(self.correspondent_id, self.no_correspondent),
+            document_type_id: clearable(self.type_id, self.no_type),
+            storage_path_id: clearable(self.storage_path_id, self.no_storage_path),
+            tag_ids: if self.no_tags {
+                Some(Vec::new())
+            } else if self.tag_ids.is_empty() {
+                None
+            } else {
+                Some(self.tag_ids.clone())
+            },
+            created: self.created.clone(),
+            custom_fields: None,
+        }
+    }
 }
 
 #[derive(Args, Debug)]
@@ -221,14 +251,46 @@ struct DocumentEditArgs {
     title: Option<String>,
     #[arg(long)]
     correspondent_id: Option<u64>,
+    #[arg(long, conflicts_with = "correspondent_id")]
+    no_correspondent: bool,
     #[arg(long)]
     type_id: Option<u64>,
+    #[arg(long, conflicts_with = "type_id")]
+    no_type: bool,
+    #[arg(long)]
+    storage_path_id: Option<u64>,
+    #[arg(long, conflicts_with = "storage_path_id")]
+    no_storage_path: bool,
     #[arg(long)]
     created: Option<String>,
     #[arg(long = "add-tag")]
     add_tags: Vec<String>,
     #[arg(long = "remove-tag")]
     remove_tags: Vec<String>,
+    #[arg(long, conflicts_with_all = ["add_tags", "remove_tags"])]
+    no_tags: bool,
+}
+
+impl DocumentEditArgs {
+    fn to_request(&self) -> UpdateRequest {
+        UpdateRequest {
+            title: self.title.clone(),
+            correspondent_id: clearable(self.correspondent_id, self.no_correspondent),
+            document_type_id: clearable(self.type_id, self.no_type),
+            storage_path_id: clearable(self.storage_path_id, self.no_storage_path),
+            tag_ids: self.no_tags.then(Vec::new),
+            created: self.created.clone(),
+            custom_fields: None,
+        }
+    }
+}
+
+fn clearable(value: Option<u64>, clear: bool) -> Option<Option<u64>> {
+    if clear {
+        Some(None)
+    } else {
+        value.map(Some)
+    }
 }
 
 #[derive(Args, Debug)]
@@ -615,14 +677,7 @@ fn run_command(
                     data: edit_document(
                         &client,
                         args.id,
-                        &UpdateRequest {
-                            title: args.title,
-                            correspondent_id: args.correspondent_id,
-                            document_type_id: args.type_id,
-                            tag_ids: None,
-                            created: args.created,
-                            custom_fields: None,
-                        },
+                        &args.to_request(),
                         &args.add_tags,
                         &args.remove_tags,
                     )?,
@@ -631,22 +686,7 @@ fn run_command(
                 DocumentsCommand::Update(args) => OutputEnvelope {
                     mode: output_name(output).to_string(),
                     command: "documents update".to_string(),
-                    data: update_document(
-                        &client,
-                        args.id,
-                        &UpdateRequest {
-                            title: args.title,
-                            correspondent_id: args.correspondent_id,
-                            document_type_id: args.type_id,
-                            tag_ids: if args.tag_ids.is_empty() {
-                                None
-                            } else {
-                                Some(args.tag_ids)
-                            },
-                            created: args.created,
-                            custom_fields: None,
-                        },
-                    )?,
+                    data: update_document(&client, args.id, &args.to_request())?,
                     security: auditor.review_once(&audit_state(paths, Some(&config), None)),
                 },
                 DocumentsCommand::Delete(args) => {
@@ -1062,14 +1102,7 @@ fn run_demo_command(
                 data: edit_document(
                     &client,
                     args.id,
-                    &UpdateRequest {
-                        title: args.title,
-                        correspondent_id: args.correspondent_id,
-                        document_type_id: args.type_id,
-                        tag_ids: None,
-                        created: args.created,
-                        custom_fields: None,
-                    },
+                    &args.to_request(),
                     &args.add_tags,
                     &args.remove_tags,
                 )?,
@@ -1078,22 +1111,7 @@ fn run_demo_command(
             DocumentsCommand::Update(args) => OutputEnvelope {
                 mode: output_name(output).to_string(),
                 command: "documents update".to_string(),
-                data: update_document(
-                    &client,
-                    args.id,
-                    &UpdateRequest {
-                        title: args.title,
-                        correspondent_id: args.correspondent_id,
-                        document_type_id: args.type_id,
-                        tag_ids: if args.tag_ids.is_empty() {
-                            None
-                        } else {
-                            Some(args.tag_ids)
-                        },
-                        created: args.created,
-                        custom_fields: None,
-                    },
-                )?,
+                data: update_document(&client, args.id, &args.to_request())?,
                 security: Vec::new(),
             },
             DocumentsCommand::Delete(args) => {
