@@ -851,22 +851,22 @@ fn document_update_rejects_value_and_clear_flag_together() {
     let any = server.mock(|_, then| {
         then.status(500);
     });
-    for args in [
-        ["--correspondent-id", "3", "--no-correspondent"],
-        ["--type-id", "3", "--no-type"],
-        ["--tag-id", "3", "--no-tags"],
-        ["--storage-path-id", "3", "--no-storage-path"],
+    for (command, args) in [
+        ("update", ["--correspondent-id", "3", "--no-correspondent"]),
+        ("update", ["--type-id", "3", "--no-type"]),
+        ("update", ["--tag-id", "3", "--no-tags"]),
+        ("update", ["--storage-path-id", "3", "--no-storage-path"]),
+        ("edit", ["--correspondent-id", "3", "--no-correspondent"]),
+        ("edit", ["--type-id", "3", "--no-type"]),
+        ("edit", ["--storage-path-id", "3", "--no-storage-path"]),
+        ("edit", ["--add-tag", "a", "--no-tags"]),
+        ("edit", ["--remove-tag", "a", "--no-tags"]),
     ] {
-        let mut full = vec!["document", "update", "42"];
+        let mut full = vec!["document", command, "42"];
         full.extend(args);
         let output = run_with_server(&server, &full);
-        assert!(!output.status.success(), "{args:?} was accepted");
+        assert!(!output.status.success(), "{command} {args:?} was accepted");
         assert!(String::from_utf8_lossy(&output.stderr).contains("cannot be used with"));
     }
-    let output = run_with_server(
-        &server,
-        &["document", "edit", "42", "--add-tag", "a", "--no-tags"],
-    );
-    assert!(!output.status.success());
     any.assert_calls(0);
 }

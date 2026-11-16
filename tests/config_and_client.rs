@@ -419,6 +419,35 @@ fn upload_and_update_requests_encode_expected_payloads() {
 }
 
 #[test]
+fn update_document_sends_null_and_empty_tags_to_clear_fields() {
+    let transport = MockTransport::default();
+    transport.push_json(
+        200,
+        "https://paperless.test/api/documents/42/",
+        json!({"id": 42}),
+    );
+    let client = ApiClient::new(transport.clone());
+
+    services::update_document(
+        &client,
+        42,
+        &UpdateRequest {
+            correspondent_id: Some(None),
+            tag_ids: Some(vec![]),
+            ..UpdateRequest::default()
+        },
+    )
+    .unwrap();
+
+    let requests = transport.requests();
+    assert_eq!(requests[0].method, HttpMethod::Patch);
+    assert_eq!(
+        requests[0].json_body.as_ref().unwrap(),
+        &json!({"correspondent": null, "tags": []})
+    );
+}
+
+#[test]
 fn document_edit_resolves_exact_tag_names_and_merges_tags() {
     let transport = MockTransport::default();
     transport.push_json(
