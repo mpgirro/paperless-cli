@@ -39,6 +39,7 @@ pub struct RequestData {
     pub json_body: Option<Value>,
     pub multipart_fields: Vec<(String, String)>,
     pub multipart_file: Option<MultipartFile>,
+    pub follow_redirects: bool,
 }
 
 impl RequestData {
@@ -50,6 +51,7 @@ impl RequestData {
             json_body: None,
             multipart_fields: Vec::new(),
             multipart_file: None,
+            follow_redirects: true,
         }
     }
 
@@ -61,6 +63,7 @@ impl RequestData {
             json_body: None,
             multipart_fields: Vec::new(),
             multipart_file: None,
+            follow_redirects: true,
         }
     }
 }
@@ -96,6 +99,7 @@ pub struct ReqwestTransport {
     config: AppConfig,
     client: reqwest::blocking::Client,
     upload_client: reqwest::blocking::Client,
+    no_redirect_client: reqwest::blocking::Client,
 }
 
 impl ReqwestTransport {
@@ -115,11 +119,17 @@ impl ReqwestTransport {
             .timeout(None)
             .connect_timeout(config.http_timeout())
             .build()?;
+        let no_redirect_client = reqwest::blocking::Client::builder()
+            .timeout(config.http_timeout())
+            .connect_timeout(config.http_timeout())
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
 
         Ok(Self {
             config,
             client,
             upload_client,
+            no_redirect_client,
         })
     }
 
@@ -132,6 +142,8 @@ impl ReqwestTransport {
     fn execute(&self, request: RequestData) -> Result<reqwest::blocking::Response, AppError> {
         let client = if request.multipart_file.is_some() {
             &self.upload_client
+        } else if !request.follow_redirects {
+            &self.no_redirect_client
         } else {
             &self.client
         };
@@ -323,16 +335,10 @@ impl<T: Transport> ApiClient<T> {
     }
 
     /// Like the typed helpers, but a non-2xx error carries the raw response body.
-    pub fn send_json(&self, request: RequestData) -> Result<Value, AppError> {
+    pub fn send_raw(&self, request: RequestData) -> Result<ResponseData, AppError> {
         let response = self.transport.send(request)?;
-        if !(200..300).contains(&response.status) {
-            return Err(AppError::Http {
-                status: response.status,
-                url: response.url,
-                message: String::from_utf8_lossy(&response.body).into_owned(),
-            });
-        }
-        parse_json_body(&response)
+        check_raw_response(&response)?;
+        Ok(response)
     }
 
     pub fn delete(&self, path: &str) -> Result<(), AppError> {
@@ -345,9 +351,30 @@ impl<T: Transport> ApiClient<T> {
     pub fn paginate(
         &self,
         path: &str,
-        mut query: Vec<(String, String)>,
+        query: Vec<(String, String)>,
     ) -> Result<Vec<Value>, AppError> {
-        if !query.iter().any(|(key, _)| key == "page_size") {
+        self.paginate_pages(path, query, false)
+    }
+
+    /// Like `paginate`, but a non-2xx error carries the raw body and a page without `results` fails.
+    pub fn paginate_raw(
+        &self,
+        path: &str,
+        query: Vec<(String, String)>,
+    ) -> Result<Vec<Value>, AppError> {
+        self.paginate_pages(path, query, true)
+    }
+
+    fn paginate_pages(
+        &self,
+        path: &str,
+        mut query: Vec<(String, String)>,
+        raw: bool,
+    ) -> Result<Vec<Value>, AppError> {
+        let path_has_page_size = path
+            .split_once('?')
+            .is_some_and(|(_, params)| params.split('&').any(|p| p.starts_with("page_size=")));
+        if !path_has_page_size && !query.iter().any(|(key, _)| key == "page_size") {
             query.push(("page_size".to_string(), "100".to_string()));
         }
 
@@ -363,7 +390,11 @@ impl<T: Transport> ApiClient<T> {
             request.query = params.clone();
 
             let response = self.transport.send(request)?;
-            check_response(&response)?;
+            if raw {
+                check_raw_response(&response)?;
+            } else {
+                check_response(&response)?;
+            }
             let current_url = response.url.clone();
             let value = parse_json_body(&response)?;
             if let Some(items) = value.as_array() {
@@ -375,8 +406,14 @@ impl<T: Transport> ApiClient<T> {
                 AppError::Message("Paginated response must be an object or list".to_string())
             })?;
 
-            if let Some(items) = response_object.get("results").and_then(Value::as_array) {
-                results.extend(items.iter().cloned());
+            match response_object.get("results").and_then(Value::as_array) {
+                Some(items) => results.extend(items.iter().cloned()),
+                None if raw => {
+                    return Err(AppError::Message(format!(
+                        "Response from {current_url} has no `results` list to paginate"
+                    )))
+                }
+                None => {}
             }
 
             next = response_object
@@ -465,6 +502,17 @@ pub fn parse_json_body(response: &ResponseData) -> Result<Value, AppError> {
         return Ok(json!({}));
     }
     Ok(serde_json::from_slice(&response.body)?)
+}
+
+fn check_raw_response(response: &ResponseData) -> Result<(), AppError> {
+    if (200..300).contains(&response.status) {
+        return Ok(());
+    }
+    Err(AppError::Http {
+        status: response.status,
+        url: response.url.clone(),
+        message: String::from_utf8_lossy(&response.body).into_owned(),
+    })
 }
 
 pub fn check_response(response: &ResponseData) -> Result<(), AppError> {

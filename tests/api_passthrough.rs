@@ -1,7 +1,7 @@
 use std::fs;
 use std::process::{Command, Output};
 
-use httpmock::Method::{GET, POST};
+use httpmock::Method::{DELETE, GET, POST};
 use httpmock::MockServer;
 use serde_json::{json, Value};
 use tempfile::tempdir;
@@ -190,4 +190,130 @@ fn all_is_rejected_for_non_get_methods() {
 
     mock.assert_calls(0);
     assert!(!output.status.success());
+}
+
+#[test]
+fn a_missing_trailing_slash_is_added_before_the_query() {
+    let server = MockServer::start();
+    let mock = server.mock(|when, then| {
+        when.method(POST)
+            .path("/api/documents/1/notes/")
+            .query_param("x", "1");
+        then.status(200).body(r#"{"id":1}"#);
+    });
+
+    let output = run_api(
+        &server,
+        &["POST", "documents/1/notes?x=1", "--data", r#"{"note":"n"}"#],
+    );
+
+    mock.assert();
+    assert!(output.status.success());
+}
+
+#[test]
+fn a_redirected_write_fails_instead_of_turning_into_a_get() {
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(POST).path("/api/old/");
+        then.status(301).header("location", "/api/new/");
+    });
+    let get = server.mock(|when, then| {
+        when.method(GET).path("/api/new/");
+        then.status(200).body("[]");
+    });
+
+    let output = run_api(&server, &["POST", "old/", "--data", "{}"]);
+
+    get.assert_calls(0);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("301"));
+}
+
+#[test]
+fn a_non_json_success_body_is_printed_raw() {
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/api/documents/1/download/");
+        then.status(200).body("%PDF-1.4 raw");
+    });
+
+    let output = run_api(&server, &["GET", "documents/1/download/"]);
+
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"%PDF-1.4 raw");
+}
+
+#[test]
+fn an_empty_204_prints_an_empty_object() {
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(DELETE).path("/api/tags/3/");
+        then.status(204);
+    });
+
+    let output = run_api(&server, &["DELETE", "tags/3/"]);
+
+    assert!(output.status.success());
+    assert_eq!(stdout_json(&output), json!({}));
+}
+
+#[test]
+fn all_puts_the_raw_error_body_on_stderr() {
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/api/trash/");
+        then.status(403).body(r#"{"detail":"custom denial"}"#);
+    });
+
+    let output = run_api(&server, &["GET", "trash/", "--all"]);
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("custom denial"));
+}
+
+#[test]
+fn all_fails_on_a_response_without_results() {
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/api/documents/1/");
+        then.status(200).body(r#"{"id":1}"#);
+    });
+
+    let output = run_api(&server, &["GET", "documents/1/", "--all"]);
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn all_keeps_a_page_size_given_in_the_path() {
+    let server = MockServer::start();
+    let mock = server.mock(|when, then| {
+        when.method(GET)
+            .path("/api/trash/")
+            .query_param("page_size", "5")
+            .query_param_count("page_size", ".*", 1);
+        then.status(200).body(r#"{"next":null,"results":[]}"#);
+    });
+
+    let output = run_api(&server, &["GET", "trash/?page_size=5", "--all"]);
+
+    mock.assert();
+    assert!(output.status.success());
+}
+
+#[test]
+fn all_refuses_a_cross_host_next_link() {
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/api/trash/");
+        then.status(200)
+            .body(r#"{"next":"http://other.invalid/api/trash/?page=2","results":[{"id":1}]}"#);
+    });
+
+    let output = run_api(&server, &["GET", "trash/", "--all"]);
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cross-origin"));
 }

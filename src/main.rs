@@ -1305,8 +1305,8 @@ fn run_api(args: ApiArgs, paths: &AppPaths, overrides: Overrides) -> Result<(), 
     let config = load_config_with_override(paths, overrides)?;
     let client = client_for_config(&config)?;
     let body = args.data.as_deref().map(parse_json_data).transpose()?;
-    let value = api_passthrough(&client, args.method, &args.path, args.query, body, args.all)?;
-    println!("{}", serde_json::to_string_pretty(&value)?);
+    let bytes = api_passthrough(&client, args.method, &args.path, args.query, body, args.all)?;
+    io::stdout().write_all(&bytes)?;
     Ok(())
 }
 

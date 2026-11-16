@@ -614,7 +614,8 @@ pub fn bulk_download_zip<T: Transport>(
     Ok(output_path.to_path_buf())
 }
 
-/// Raw call for `paperless api`. With `all`, a GET follows `next` links and returns the merged `results`.
+/// Raw call for `paperless api`; returns the bytes to print. With `all`, a GET follows
+/// `next` links and returns the merged `results`.
 pub fn api_passthrough<T: Transport>(
     client: &ApiClient<T>,
     method: HttpMethod,
@@ -622,19 +623,50 @@ pub fn api_passthrough<T: Transport>(
     query: Vec<(String, String)>,
     body: Option<Value>,
     all: bool,
-) -> Result<Value, AppError> {
+) -> Result<Vec<u8>, AppError> {
+    let path = with_trailing_slash(path);
     if all {
         if method != HttpMethod::Get || body.is_some() {
             return Err(AppError::Message(
                 "--all works only with GET and without --data".to_string(),
             ));
         }
-        return Ok(Value::Array(client.paginate(path, query)?));
+        return pretty_json(&Value::Array(client.paginate_raw(&path, query)?));
     }
+    let follow_redirects = method == HttpMethod::Get;
     let mut request = RequestData::new(method, path);
     request.query = query;
     request.json_body = body;
-    client.send_json(request)
+    // A followed 301/302 turns a write into a GET and loses it.
+    request.follow_redirects = follow_redirects;
+    let response = client.send_raw(request)?;
+    if response.body.is_empty() {
+        return pretty_json(&json!({}));
+    }
+    match serde_json::from_slice::<Value>(&response.body) {
+        Ok(value) => pretty_json(&value),
+        // The request succeeded, so print the body as is rather than fail and invite a retry.
+        Err(_) => Ok(response.body),
+    }
+}
+
+fn pretty_json(value: &Value) -> Result<Vec<u8>, AppError> {
+    let mut bytes = serde_json::to_vec_pretty(value)?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+// Every Paperless endpoint ends in `/`; without it Django answers with a redirect.
+fn with_trailing_slash(path: &str) -> String {
+    let (route, query) = match path.split_once('?') {
+        Some((route, query)) => (route, Some(query)),
+        None => (path, None),
+    };
+    let slash = if route.ends_with('/') { "" } else { "/" };
+    match query {
+        Some(query) => format!("{route}{slash}?{query}"),
+        None => format!("{route}{slash}"),
+    }
 }
 
 pub fn status<T: Transport>(client: &ApiClient<T>, config: &AppConfig) -> Result<Value, AppError> {
