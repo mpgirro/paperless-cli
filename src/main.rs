@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
-use paperless_cli::api::{ApiClient, ReqwestTransport};
+use paperless_cli::api::{ApiClient, HttpMethod, ReqwestTransport};
 use paperless_cli::config::{load_config, save_config, AppConfig, AppPaths, OutputMode};
 use paperless_cli::demo::{demo_config, DemoTransport};
 use paperless_cli::error::AppError;
@@ -12,18 +12,18 @@ use paperless_cli::pdf::{read_local_pdf_info, read_local_pdf_text};
 use paperless_cli::render::render_output;
 use paperless_cli::security::{SecurityAgentProfile, SecurityAuditor};
 use paperless_cli::services::{
-    audit_state, autocomplete_search, bulk_download, bulk_download_zip, connection_info,
-    create_correspondent, create_document_type, create_tag, dashboard, delete_correspondent,
-    delete_document, delete_document_type, delete_tag, download_document, download_preview,
-    download_thumbnail, edit_document, get_correspondent, get_document, get_document_content,
-    get_document_type, get_tag, get_task, init_connection, list_correspondents,
-    list_document_types, list_documents, list_tags, list_tasks, operational_overview,
-    persist_session, ping, query_search, sanitize_filename, search_documents, status,
-    update_document, update_tag, upload_document, DocumentQuery, OutputEnvelope, TagUpdateRequest,
-    UpdateRequest, UploadRequest,
+    api_passthrough, audit_state, autocomplete_search, bulk_download, bulk_download_zip,
+    connection_info, create_correspondent, create_document_type, create_tag, dashboard,
+    delete_correspondent, delete_document, delete_document_type, delete_tag, download_document,
+    download_preview, download_thumbnail, edit_document, get_correspondent, get_document,
+    get_document_content, get_document_type, get_tag, get_task, init_connection,
+    list_correspondents, list_document_types, list_documents, list_tags, list_tasks,
+    operational_overview, persist_session, ping, query_search, sanitize_filename, search_documents,
+    status, update_document, update_tag, upload_document, DocumentQuery, OutputEnvelope,
+    TagUpdateRequest, UpdateRequest, UploadRequest,
 };
 use paperless_cli::tui::run_tui;
-use serde_json::json;
+use serde_json::{json, Value};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -74,6 +74,8 @@ enum RootCommand {
     DocumentTypes(DocumentTypesCommand),
     #[command(name = "export", subcommand)]
     Export(ExportCommand),
+    /// Call any API endpoint with the stored URL and token and print the response JSON.
+    Api(ApiArgs),
     /// Fetch status, statistics, and tasks for a full operational overview.
     Dashboard,
     /// Check server health and authentication using only GET /api/status/.
@@ -330,6 +332,24 @@ struct BulkArgs {
     original: bool,
     #[arg(long, default_value_t = false)]
     zip: bool,
+}
+
+#[derive(Args, Debug)]
+struct ApiArgs {
+    /// GET, POST, PATCH, PUT or DELETE (case-insensitive).
+    #[arg(value_parser = parse_http_method)]
+    method: HttpMethod,
+    /// Path relative to /api/, e.g. trash/ or documents/123/history/.
+    path: String,
+    /// JSON request body, or @file.json to read it from a file.
+    #[arg(long)]
+    data: Option<String>,
+    /// Query parameter, repeatable.
+    #[arg(long, value_name = "KEY=VALUE", value_parser = parse_query_pair)]
+    query: Vec<(String, String)>,
+    /// Follow `next` links of a paginated GET and print the merged `results`.
+    #[arg(long, default_value_t = false)]
+    all: bool,
 }
 
 #[derive(Args, Debug)]
@@ -837,6 +857,7 @@ fn run_command(
                 security: auditor.review_once(&audit_state(paths, Some(&config), None)),
             }
         }
+        RootCommand::Api(args) => return run_api(args, paths, overrides),
         RootCommand::Dashboard => {
             let config = load_config_with_override(paths, overrides)?;
             let client = client_for_config(&config)?;
@@ -1241,6 +1262,11 @@ fn run_demo_command(
                 security: Vec::new(),
             }
         }
+        RootCommand::Api(_) => {
+            return Err(AppError::Message(
+                "`api` is not available in demo mode.".to_string(),
+            ))
+        }
         RootCommand::Dashboard => OutputEnvelope {
             mode: output_name(output).to_string(),
             command: "dashboard".to_string(),
@@ -1273,6 +1299,42 @@ fn demo_notice_envelope(
         data,
         security: Vec::new(),
     }
+}
+
+fn run_api(args: ApiArgs, paths: &AppPaths, overrides: Overrides) -> Result<(), AppError> {
+    let config = load_config_with_override(paths, overrides)?;
+    let client = client_for_config(&config)?;
+    let body = args.data.as_deref().map(parse_json_data).transpose()?;
+    let value = api_passthrough(&client, args.method, &args.path, args.query, body, args.all)?;
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
+fn parse_json_data(data: &str) -> Result<Value, AppError> {
+    let text = match data.strip_prefix('@') {
+        Some(path) => std::fs::read_to_string(path)
+            .map_err(|error| AppError::Message(format!("Cannot read {path}: {error}")))?,
+        None => data.to_string(),
+    };
+    Ok(serde_json::from_str(&text)?)
+}
+
+fn parse_http_method(value: &str) -> Result<HttpMethod, String> {
+    match value.to_ascii_uppercase().as_str() {
+        "GET" => Ok(HttpMethod::Get),
+        "POST" => Ok(HttpMethod::Post),
+        "PATCH" => Ok(HttpMethod::Patch),
+        "PUT" => Ok(HttpMethod::Put),
+        "DELETE" => Ok(HttpMethod::Delete),
+        _ => Err("expected GET, POST, PATCH, PUT or DELETE".to_string()),
+    }
+}
+
+fn parse_query_pair(value: &str) -> Result<(String, String), String> {
+    value
+        .split_once('=')
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .ok_or_else(|| "expected KEY=VALUE".to_string())
 }
 
 fn client_for_config(config: &AppConfig) -> Result<ApiClient<ReqwestTransport>, AppError> {

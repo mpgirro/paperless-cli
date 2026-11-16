@@ -85,7 +85,7 @@ For fast iteration on layout and keyboard behavior, use `paperless --demo`.
 
 | Area | Commands |
 | --- | --- |
-| top level | `login`, `status`, `dashboard`, default TUI |
+| top level | `login`, `status`, `dashboard`, `api`, default TUI |
 | `config` | `set-url`, `set-token` |
 | `pdf` | `read`, `info` |
 | `project` | `login`, `info`, `ping` |
@@ -96,6 +96,23 @@ For fast iteration on layout and keyboard behavior, use `paperless --demo`.
 | `correspondent` | `list`, `get`, `create`, `delete` |
 | `doctype` | `list`, `get`, `create`, `delete` |
 | `export` | `bulk` |
+
+### Raw API calls
+
+`paperless api` reaches endpoints the CLI does not wrap, with the stored URL and
+token, so the token never has to enter the shell:
+
+```sh
+paperless api GET status/
+paperless api GET documents/ --query title__icontains=invoice --query page_size=5
+paperless api POST documents/bulk_edit/ --data '{"documents":[1],"method":"delete"}'
+paperless api PATCH tags/3/ --data @tag.json
+paperless api GET trash/ --all
+```
+
+`PATH` is relative to `/api/`. The response JSON goes to stdout. A non-2xx
+status exits non-zero with the response body on stderr. `--all` follows `next`
+links of a paginated GET and prints the merged `results` as one array.
 
 ### Network behavior
 

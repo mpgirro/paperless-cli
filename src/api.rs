@@ -322,6 +322,19 @@ impl<T: Transport> ApiClient<T> {
         self.decode_json_response(response)
     }
 
+    /// Like the typed helpers, but a non-2xx error carries the raw response body.
+    pub fn send_json(&self, request: RequestData) -> Result<Value, AppError> {
+        let response = self.transport.send(request)?;
+        if !(200..300).contains(&response.status) {
+            return Err(AppError::Http {
+                status: response.status,
+                url: response.url,
+                message: String::from_utf8_lossy(&response.body).into_owned(),
+            });
+        }
+        parse_json_body(&response)
+    }
+
     pub fn delete(&self, path: &str) -> Result<(), AppError> {
         let request = RequestData::new(HttpMethod::Delete, path);
         let response = self.transport.send(request)?;
