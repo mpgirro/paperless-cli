@@ -230,3 +230,18 @@ fn demo_mode_answers_every_subcommand() {
         assert_success(&output);
     }
 }
+
+#[test]
+fn empty_with_stdin_ids_requires_yes() {
+    let server = MockServer::start();
+    let any = server.mock(|_, then| {
+        then.status(500);
+    });
+
+    let output = run_paperless(Some(&server), &["trash", "empty", "-"], Some("2\n"));
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("IDs from stdin need --yes"), "{stderr}");
+    any.assert_calls(0);
+}

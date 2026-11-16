@@ -141,8 +141,9 @@ no history of permission changes, so check with `--dry-run` first.
 trash, across all pages. `trash restore` and `trash empty` take document IDs;
 `-` reads them from stdin and duplicates are dropped. `trash empty` deletes the
 documents for good, so it asks first. Pass `--yes` to skip the question; without
-it, a non-interactive run refuses. Neither command runs without at least one ID,
-because Paperless empties the whole trash when the request names no documents.
+it, a non-interactive run refuses, and so does a run that reads IDs from stdin.
+Neither command runs without at least one ID, because Paperless empties the
+whole trash when the request names no documents.
 
 ```sh
 paperless trash list
