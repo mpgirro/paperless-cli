@@ -421,6 +421,10 @@ fn run_trash<T: Transport>(
             trash_action(client, "restore", &read_document_ids(&args.ids)?)?,
         )),
         TrashCommand::Empty(args) => {
+            // The prompt reads stdin too, so it cannot also carry the IDs.
+            if !args.yes && args.documents.ids.iter().any(|id| id == "-") {
+                return Err(AppError::Message("IDs from stdin need --yes.".to_string()));
+            }
             let ids = unique(&read_document_ids(&args.documents.ids)?);
             if !ids.is_empty() && !args.yes {
                 confirm_empty_trash(&ids)?;
@@ -445,13 +449,17 @@ fn confirm_empty_trash(ids: &[u64]) -> Result<(), AppError> {
     io::stderr().flush()?;
     let mut answer = String::new();
     io::stdin().read_line(&mut answer)?;
-    if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+    if confirmed(&answer) {
         Ok(())
     } else {
         Err(AppError::Message(
             "Aborted. Nothing was deleted.".to_string(),
         ))
     }
+}
+
+fn confirmed(answer: &str) -> bool {
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 fn parse_document_id(value: &str) -> Result<u64, AppError> {
@@ -1861,5 +1869,20 @@ fn ensure_interactive() -> Result<(), AppError> {
         Err(AppError::Message(
             "Missing login details. Provide --url and either --token or --username/--password, or run `paperless login` interactively.".to_string(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::confirmed;
+
+    #[test]
+    fn confirmed_accepts_only_yes() {
+        for answer in ["y", "YES", " y\n"] {
+            assert!(confirmed(answer), "{answer:?}");
+        }
+        for answer in ["", "n", "yes please"] {
+            assert!(!confirmed(answer), "{answer:?}");
+        }
     }
 }
