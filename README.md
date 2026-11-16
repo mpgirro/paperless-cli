@@ -96,6 +96,7 @@ For fast iteration on layout and keyboard behavior, use `paperless --demo`.
 | `correspondent` | `list`, `get`, `create`, `delete` |
 | `doctype` | `list`, `get`, `create`, `delete` |
 | `export` | `bulk` |
+| `trash` | `list`, `restore`, `empty` |
 
 ### Updating documents
 
@@ -133,6 +134,21 @@ the documents without an owner, which makes them visible to all users. Each of
 `--view-users`, `--view-groups`, `--change-users` and `--change-groups` replaces
 that list; `none` empties it. A list not given stays as it is. Paperless keeps
 no history of permission changes, so check with `--dry-run` first.
+
+### Trash
+
+`trash list` shows the ID, deletion time and title of each document in the
+trash, across all pages. `trash restore` and `trash empty` take document IDs;
+`-` reads them from stdin and duplicates are dropped. `trash empty` deletes the
+documents for good, so it asks first. Pass `--yes` to skip the question; without
+it, a non-interactive run refuses. Neither command runs without at least one ID,
+because Paperless empties the whole trash when the request names no documents.
+
+```sh
+paperless trash list
+paperless trash restore 12 13
+paperless trash empty 12 --yes
+```
 
 ### Raw API calls
 

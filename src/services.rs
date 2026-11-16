@@ -734,7 +734,7 @@ pub fn bulk_operations(
     Ok(operations)
 }
 
-fn unique(ids: &[u64]) -> Vec<u64> {
+pub fn unique(ids: &[u64]) -> Vec<u64> {
     let mut seen = std::collections::HashSet::new();
     ids.iter().copied().filter(|id| seen.insert(*id)).collect()
 }
@@ -764,6 +764,38 @@ pub fn bulk_edit<T: Transport>(
         results.push(json!({ "method": operation.method, "response": response }));
     }
     Ok(Value::Array(results))
+}
+
+/// Lists the trash with each document reduced to id, title and deleted_at.
+pub fn list_trash<T: Transport>(client: &ApiClient<T>) -> Result<Value, AppError> {
+    let documents = client.paginate("trash/", Vec::new())?;
+    Ok(documents
+        .iter()
+        .map(|document| {
+            json!({
+                "id": document["id"],
+                "title": document["title"],
+                "deleted_at": document["deleted_at"],
+            })
+        })
+        .collect())
+}
+
+/// `action` is `restore` or `empty`. Duplicate IDs are dropped because Paperless rejects them.
+pub fn trash_action<T: Transport>(
+    client: &ApiClient<T>,
+    action: &str,
+    document_ids: &[u64],
+) -> Result<Value, AppError> {
+    let documents = unique(document_ids);
+    // Paperless empties the whole trash when `documents` is missing, so never send without IDs.
+    if documents.is_empty() {
+        return Err(AppError::Message("No document IDs given.".to_string()));
+    }
+    client.post_json(
+        "trash/",
+        json!({ "action": action, "documents": documents }),
+    )
 }
 
 /// Raw call for `paperless api`; returns the bytes to print. With `all`, a GET follows
