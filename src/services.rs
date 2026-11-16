@@ -614,6 +614,29 @@ pub fn bulk_download_zip<T: Transport>(
     Ok(output_path.to_path_buf())
 }
 
+/// Raw call for `paperless api`. With `all`, a GET follows `next` links and returns the merged `results`.
+pub fn api_passthrough<T: Transport>(
+    client: &ApiClient<T>,
+    method: HttpMethod,
+    path: &str,
+    query: Vec<(String, String)>,
+    body: Option<Value>,
+    all: bool,
+) -> Result<Value, AppError> {
+    if all {
+        if method != HttpMethod::Get || body.is_some() {
+            return Err(AppError::Message(
+                "--all works only with GET and without --data".to_string(),
+            ));
+        }
+        return Ok(Value::Array(client.paginate(path, query)?));
+    }
+    let mut request = RequestData::new(method, path);
+    request.query = query;
+    request.json_body = body;
+    client.send_json(request)
+}
+
 pub fn status<T: Transport>(client: &ApiClient<T>, config: &AppConfig) -> Result<Value, AppError> {
     ping(client, config)
 }
