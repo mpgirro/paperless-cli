@@ -126,6 +126,25 @@ fn dispatch_demo_request(
         (HttpMethod::Post, ["documents", "bulk_edit" | "reprocess"]) => {
             ok_json(normalized, json!({ "result": "OK" }))
         }
+        (HttpMethod::Get, ["trash"]) => ok_json(
+            normalized,
+            json!({
+                "count": 1,
+                "next": null,
+                "results": [{
+                    "id": 401,
+                    "title": "Expired Parking Permit 2025",
+                    "deleted_at": "2026-04-01T09:30:00Z",
+                }],
+            }),
+        ),
+        (HttpMethod::Post, ["trash"]) => ok_json(
+            normalized,
+            json!({
+                "result": "OK",
+                "doc_ids": json_body.as_ref().map(|body| body["documents"].clone()),
+            }),
+        ),
         (HttpMethod::Post, ["documents", "bulk_download"]) => ok_binary(
             normalized,
             vec![0x50, 0x4b, 0x03, 0x04, b'D', b'E', b'M', b'O'],

@@ -35,6 +35,24 @@ const DOCUMENT_COLUMNS: &[CollectionColumn] = &[
     },
 ];
 
+const TRASH_COLUMNS: &[CollectionColumn] = &[
+    CollectionColumn {
+        header: "ID",
+        keys: &["id"],
+        style: CellStyle::Value,
+    },
+    CollectionColumn {
+        header: "DELETED",
+        keys: &["deleted_at"],
+        style: CellStyle::Value,
+    },
+    CollectionColumn {
+        header: "TITLE",
+        keys: &["title"],
+        style: CellStyle::Value,
+    },
+];
+
 const TAG_COLUMNS: &[CollectionColumn] = &[
     CollectionColumn {
         header: "ID",
@@ -144,6 +162,9 @@ fn render_collection_terminal(command: &str, data: &Value) -> Option<Vec<String>
         }
         "search query" => render_global_search(data),
         "tags list" => render_tabular_collection(data, "tag", "tags", TAG_COLUMNS),
+        "trash list" => {
+            render_tabular_collection(data, "trashed document", "trashed documents", TRASH_COLUMNS)
+        }
         "correspondents list" => render_tabular_collection(
             data,
             "correspondent",

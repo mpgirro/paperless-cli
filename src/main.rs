@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
-use paperless_cli::api::{ApiClient, HttpMethod, ReqwestTransport};
+use paperless_cli::api::{ApiClient, HttpMethod, ReqwestTransport, Transport};
 use paperless_cli::config::{load_config, save_config, AppConfig, AppPaths, OutputMode};
 use paperless_cli::demo::{demo_config, DemoTransport};
 use paperless_cli::error::AppError;
@@ -17,10 +17,11 @@ use paperless_cli::services::{
     dashboard, delete_correspondent, delete_document, delete_document_type, delete_tag,
     download_document, download_preview, download_thumbnail, edit_document, get_correspondent,
     get_document, get_document_content, get_document_type, get_tag, get_task, init_connection,
-    list_correspondents, list_document_types, list_documents, list_tags, list_tasks,
+    list_correspondents, list_document_types, list_documents, list_tags, list_tasks, list_trash,
     operational_overview, persist_session, ping, query_search, sanitize_filename, search_documents,
-    status, update_document, update_tag, upload_document, BulkEditRequest, BulkOperation,
-    BulkPermissions, DocumentQuery, OutputEnvelope, TagUpdateRequest, UpdateRequest, UploadRequest,
+    status, trash_action, unique, update_document, update_tag, upload_document, BulkEditRequest,
+    BulkOperation, BulkPermissions, DocumentQuery, OutputEnvelope, TagUpdateRequest, UpdateRequest,
+    UploadRequest,
 };
 use paperless_cli::tui::run_tui;
 use serde_json::{json, Value};
@@ -74,6 +75,9 @@ enum RootCommand {
     DocumentTypes(DocumentTypesCommand),
     #[command(name = "export", subcommand)]
     Export(ExportCommand),
+    /// List, restore or permanently delete documents in the trash.
+    #[command(name = "trash", subcommand)]
+    Trash(TrashCommand),
     /// Call any API endpoint with the stored URL and token and print the response JSON.
     Api(ApiArgs),
     /// Fetch status, statistics, and tasks for a full operational overview.
@@ -387,18 +391,66 @@ impl DocumentBulkArgs {
     }
 
     fn operations(&self) -> Result<Vec<BulkOperation>, AppError> {
-        let mut ids = Vec::new();
-        for arg in &self.ids {
-            if arg == "-" {
-                let input = io::read_to_string(io::stdin())?;
-                for token in input.split_whitespace() {
-                    ids.push(parse_document_id(token)?);
-                }
-            } else {
-                ids.push(parse_document_id(arg)?);
+        bulk_operations(&read_document_ids(&self.ids)?, &self.to_request())
+    }
+}
+
+fn read_document_ids(args: &[String]) -> Result<Vec<u64>, AppError> {
+    let mut ids = Vec::new();
+    for arg in args {
+        if arg == "-" {
+            let input = io::read_to_string(io::stdin())?;
+            for token in input.split_whitespace() {
+                ids.push(parse_document_id(token)?);
             }
+        } else {
+            ids.push(parse_document_id(arg)?);
         }
-        bulk_operations(&ids, &self.to_request())
+    }
+    Ok(ids)
+}
+
+fn run_trash<T: Transport>(
+    client: &ApiClient<T>,
+    command: TrashCommand,
+) -> Result<(&'static str, Value), AppError> {
+    match command {
+        TrashCommand::List => Ok(("trash list", list_trash(client)?)),
+        TrashCommand::Restore(args) => Ok((
+            "trash restore",
+            trash_action(client, "restore", &read_document_ids(&args.ids)?)?,
+        )),
+        TrashCommand::Empty(args) => {
+            let ids = unique(&read_document_ids(&args.documents.ids)?);
+            if !ids.is_empty() && !args.yes {
+                confirm_empty_trash(&ids)?;
+            }
+            Ok(("trash empty", trash_action(client, "empty", &ids)?))
+        }
+    }
+}
+
+fn confirm_empty_trash(ids: &[u64]) -> Result<(), AppError> {
+    if !io::stdin().is_terminal() {
+        return Err(AppError::Message(
+            "Refusing to empty the trash without --yes: stdin is not a terminal.".to_string(),
+        ));
+    }
+    let list = ids
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    eprint!("Permanently delete documents {list}? This cannot be undone. [y/N] ");
+    io::stderr().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        Ok(())
+    } else {
+        Err(AppError::Message(
+            "Aborted. Nothing was deleted.".to_string(),
+        ))
     }
 }
 
@@ -443,6 +495,32 @@ struct AutocompleteArgs {
     term: String,
     #[arg(long, default_value_t = 10)]
     limit: u64,
+}
+
+#[derive(Subcommand, Debug)]
+enum TrashCommand {
+    /// List trashed documents with id, title and deletion time.
+    List,
+    /// Restore documents from the trash.
+    Restore(TrashIdsArgs),
+    /// Permanently delete documents from the trash. Asks first unless --yes is given.
+    Empty(TrashEmptyArgs),
+}
+
+#[derive(Args, Debug)]
+struct TrashIdsArgs {
+    /// Document IDs; `-` reads whitespace-separated IDs from stdin.
+    #[arg(required = true)]
+    ids: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+struct TrashEmptyArgs {
+    #[command(flatten)]
+    documents: TrashIdsArgs,
+    /// Skip the confirmation prompt. Required when stdin is not a terminal.
+    #[arg(long)]
+    yes: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1035,6 +1113,17 @@ fn run_command(
                 security: auditor.review_once(&audit_state(paths, Some(&config), None)),
             }
         }
+        RootCommand::Trash(trash_command) => {
+            let config = load_config_with_override(paths, overrides)?;
+            let client = client_for_config(&config)?;
+            let (command, data) = run_trash(&client, trash_command)?;
+            OutputEnvelope {
+                mode: output_name(output).to_string(),
+                command: command.to_string(),
+                data,
+                security: auditor.review_once(&audit_state(paths, Some(&config), None)),
+            }
+        }
         RootCommand::Api(args) => return run_api(args, paths, overrides),
         RootCommand::Dashboard => {
             let config = load_config_with_override(paths, overrides)?;
@@ -1424,6 +1513,15 @@ fn run_demo_command(
                 security: Vec::new(),
             }
         }
+        RootCommand::Trash(trash_command) => {
+            let (command, data) = run_trash(&client, trash_command)?;
+            OutputEnvelope {
+                mode: output_name(output).to_string(),
+                command: command.to_string(),
+                data,
+                security: Vec::new(),
+            }
+        }
         RootCommand::Api(_) => {
             return Err(AppError::Message(
                 "`api` is not available in demo mode.".to_string(),
@@ -1551,6 +1649,8 @@ fn suppressible_command(command: &str, output: OutputMode) -> bool {
             | "document-types create"
             | "document-types delete"
             | "export bulk"
+            | "trash restore"
+            | "trash empty"
     )
 }
 
