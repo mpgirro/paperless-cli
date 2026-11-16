@@ -3,7 +3,10 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 
-use crate::api::{fetch_token, multipart_file_from_path, ApiClient, Transport};
+use crate::api::{
+    fetch_token, multipart_file_from_path, ApiClient, HttpMethod, RequestData, ResponseData,
+    Transport,
+};
 use crate::config::{
     load_config, load_session, normalize_url, save_config, save_session, AppConfig, AppPaths,
     OutputMode, SessionState,
@@ -168,7 +171,12 @@ pub fn init_connection<T: Transport>(
         }
     };
 
-    let config = AppConfig::new(normalized, token, preferred_output)?;
+    let config = AppConfig {
+        timeout: load_config(paths)
+            .ok()
+            .and_then(|existing| existing.timeout),
+        ..AppConfig::new(normalized, token, preferred_output)?
+    };
     let client = client_factory(config.clone())?;
     client.ping(&config.base_url)?;
     save_config(paths, &config)?;
@@ -589,18 +597,20 @@ pub fn bulk_download_zip<T: Transport>(
     output_path: &Path,
     content: &str,
 ) -> Result<PathBuf, AppError> {
-    let response = client.post_json_raw(
-        "documents/bulk_download/",
-        json!({
-            "documents": document_ids,
-            "content": content,
-        }),
-    )?;
+    let mut request = RequestData::new(HttpMethod::Post, "documents/bulk_download/");
+    request.json_body = Some(json!({
+        "documents": document_ids,
+        "content": content,
+    }));
 
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(output_path, &response.body)?;
+    let mut part_path = output_path.as_os_str().to_owned();
+    part_path.push(".part");
+    let part_path = PathBuf::from(part_path);
+    download_to_file(client, request, &part_path)?;
+    std::fs::rename(&part_path, output_path)?;
     Ok(output_path.to_path_buf())
 }
 
@@ -818,8 +828,12 @@ fn download_asset<T: Transport>(
     output_dir: &Path,
     params: Vec<(String, String)>,
 ) -> Result<PathBuf, AppError> {
-    let response = client.get_raw(&format!("documents/{document_id}/{asset}/"), params)?;
+    let mut request =
+        RequestData::new(HttpMethod::Get, format!("documents/{document_id}/{asset}/"));
+    request.query = params;
     std::fs::create_dir_all(output_dir)?;
+    let part_path = output_dir.join(format!(".document_{document_id}_{asset}.part"));
+    let response = download_to_file(client, request, &part_path)?;
 
     let filename = response
         .headers
@@ -828,8 +842,22 @@ fn download_asset<T: Transport>(
         .map(|value| sanitize_filename(&value))
         .unwrap_or_else(|| format!("document_{document_id}_{asset}.bin"));
     let output_path = output_dir.join(filename);
-    std::fs::write(&output_path, response.body)?;
+    std::fs::rename(&part_path, &output_path)?;
     Ok(output_path)
+}
+
+fn download_to_file<T: Transport>(
+    client: &ApiClient<T>,
+    request: RequestData,
+    part_path: &Path,
+) -> Result<ResponseData, AppError> {
+    let result = std::fs::File::create(part_path)
+        .map_err(AppError::from)
+        .and_then(|mut file| client.download(request, &mut file));
+    if result.is_err() {
+        let _ = std::fs::remove_file(part_path);
+    }
+    result
 }
 
 fn extract_download_filename(content_disposition: &str) -> Option<String> {

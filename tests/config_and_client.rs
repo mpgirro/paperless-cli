@@ -1,8 +1,13 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use paperless_cli::api::{ApiClient, Endpoint, HttpMethod, RequestData, ResponseData, Transport};
+use httpmock::Method::{GET, POST};
+use httpmock::MockServer;
+use paperless_cli::api::{
+    ApiClient, Endpoint, HttpMethod, RequestData, ReqwestTransport, ResponseData, Transport,
+};
 use paperless_cli::config::{
     load_config, load_session, save_config, save_session, AppConfig, AppPaths, OutputMode,
     SessionState,
@@ -529,4 +534,86 @@ fn download_prefers_decoded_rfc5987_filenames() {
         saved.file_name().unwrap().to_string_lossy(),
         "2026-03-26_Equal_Experts.pdf"
     );
+}
+
+#[test]
+fn load_config_reads_timeout_key_and_zero_disables_it() {
+    let _env_lock = ENV_LOCK.lock().unwrap();
+    let temp = tempdir().unwrap();
+    let paths = AppPaths::new(
+        temp.path().join("config.toml"),
+        temp.path().join("session.toml"),
+    );
+
+    let mut config = AppConfig::new("https://paperless.test", "token", OutputMode::Json).unwrap();
+    assert_eq!(config.http_timeout(), Some(Duration::from_secs(30)));
+
+    config.timeout = Some(0);
+    save_config(&paths, &config).unwrap();
+    let loaded = load_config(&paths).unwrap();
+    assert_eq!(loaded.timeout, Some(0));
+    assert_eq!(loaded.http_timeout(), None);
+}
+
+#[test]
+fn reqwest_upload_is_not_cut_off_by_the_total_timeout() {
+    let server = MockServer::start();
+    let upload = server.mock(|when, then| {
+        when.method(POST).path("/api/documents/post_document/");
+        then.status(200)
+            .delay(Duration::from_secs(2))
+            .header("content-type", "application/json")
+            .body(r#""task-id""#);
+    });
+    let temp = tempdir().unwrap();
+    let file_path = temp.path().join("scan.pdf");
+    std::fs::write(&file_path, b"%PDF fake").unwrap();
+
+    let mut config = AppConfig::new(server.base_url(), "token", OutputMode::Json).unwrap();
+    config.timeout = Some(1);
+    let client = ApiClient::new(ReqwestTransport::new(config).unwrap());
+
+    services::upload_document(
+        &client,
+        &UploadRequest {
+            path: file_path,
+            title: None,
+            correspondent_id: None,
+            document_type_id: None,
+            tag_ids: Vec::new(),
+        },
+    )
+    .unwrap();
+    upload.assert_calls(1);
+}
+
+#[test]
+fn reqwest_download_streams_body_to_named_file() {
+    let server = MockServer::start();
+    let body = vec![7u8; 3 * 1024 * 1024];
+    server.mock(|when, then| {
+        when.method(GET).path("/api/documents/5/download/");
+        then.status(200)
+            .header("content-disposition", "attachment; filename=\"scan.pdf\"")
+            .body(body.clone());
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/api/documents/6/download/");
+        then.status(404).body("{}");
+    });
+    let temp = tempdir().unwrap();
+    let config = AppConfig::new(server.base_url(), "token", OutputMode::Json).unwrap();
+    let client = ApiClient::new(ReqwestTransport::new(config).unwrap());
+
+    let saved = services::download_document(&client, 5, temp.path(), false).unwrap();
+    assert_eq!(saved, temp.path().join("scan.pdf"));
+    assert_eq!(std::fs::read(&saved).unwrap(), body);
+
+    services::download_document(&client, 6, temp.path(), false).unwrap_err();
+    let mut names = std::fs::read_dir(temp.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    names.sort();
+    assert_eq!(names, vec!["scan.pdf"]);
 }

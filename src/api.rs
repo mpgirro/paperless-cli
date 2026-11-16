@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::Path;
 
 use reqwest::blocking::multipart::{Form, Part};
@@ -74,6 +75,20 @@ pub struct ResponseData {
 
 pub trait Transport {
     fn send(&self, request: RequestData) -> Result<ResponseData, AppError>;
+
+    /// Writes a successful response body to `dest` instead of `ResponseData::body`.
+    fn send_to(
+        &self,
+        request: RequestData,
+        dest: &mut dyn Write,
+    ) -> Result<ResponseData, AppError> {
+        let mut response = self.send(request)?;
+        if (200..300).contains(&response.status) {
+            dest.write_all(&response.body)?;
+            response.body.clear();
+        }
+        Ok(response)
+    }
 }
 
 #[derive(Clone)]
@@ -85,7 +100,8 @@ pub struct ReqwestTransport {
 impl ReqwestTransport {
     pub fn new(config: AppConfig) -> Result<Self, AppError> {
         let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
+            .timeout(None)
+            .connect_timeout(config.http_timeout())
             .build()?;
 
         Ok(Self { config, client })
@@ -96,8 +112,9 @@ impl ReqwestTransport {
     }
 }
 
-impl Transport for ReqwestTransport {
-    fn send(&self, request: RequestData) -> Result<ResponseData, AppError> {
+impl ReqwestTransport {
+    fn execute(&self, request: RequestData) -> Result<reqwest::blocking::Response, AppError> {
+        let is_upload = request.multipart_file.is_some();
         let url = match request.endpoint {
             Endpoint::Relative(path) => self.config.api_url(&path),
             Endpoint::Absolute(url) => url,
@@ -133,10 +150,23 @@ impl Transport for ReqwestTransport {
             builder = builder.multipart(form);
         }
 
-        let response = builder.send()?;
-        let status = response.status().as_u16();
-        let url = response.url().to_string();
-        let headers = response
+        // Blocking reqwest also applies this timeout to each body read, so a
+        // streamed download fails only when idle, not when it is merely long.
+        // shortcut: uploads get only the connect timeout, since blocking reqwest has
+        // no write-idle timeout; switch to the async client if stalled uploads hang.
+        if let (false, Some(timeout)) = (is_upload, self.config.http_timeout()) {
+            builder = builder.timeout(timeout);
+        }
+
+        Ok(builder.send()?)
+    }
+}
+
+fn response_head(response: &reqwest::blocking::Response) -> ResponseData {
+    ResponseData {
+        status: response.status().as_u16(),
+        url: response.url().to_string(),
+        headers: response
             .headers()
             .iter()
             .map(|(name, value)| {
@@ -145,15 +175,32 @@ impl Transport for ReqwestTransport {
                     value.to_str().unwrap_or_default().to_string(),
                 )
             })
-            .collect::<BTreeMap<_, _>>();
-        let body = response.bytes()?.to_vec();
+            .collect(),
+        body: Vec::new(),
+    }
+}
 
-        Ok(ResponseData {
-            status,
-            url,
-            headers,
-            body,
-        })
+impl Transport for ReqwestTransport {
+    fn send(&self, request: RequestData) -> Result<ResponseData, AppError> {
+        let response = self.execute(request)?;
+        let mut data = response_head(&response);
+        data.body = response.bytes()?.to_vec();
+        Ok(data)
+    }
+
+    fn send_to(
+        &self,
+        request: RequestData,
+        dest: &mut dyn Write,
+    ) -> Result<ResponseData, AppError> {
+        let mut response = self.execute(request)?;
+        let mut data = response_head(&response);
+        if response.status().is_success() {
+            response.copy_to(dest)?;
+        } else {
+            data.body = response.bytes()?.to_vec();
+        }
+        Ok(data)
     }
 }
 
@@ -219,14 +266,12 @@ impl<T: Transport> ApiClient<T> {
         self.decode_json_response(response)
     }
 
-    pub fn get_raw(
+    pub fn download(
         &self,
-        path: &str,
-        query: Vec<(String, String)>,
+        request: RequestData,
+        dest: &mut dyn Write,
     ) -> Result<ResponseData, AppError> {
-        let mut request = RequestData::new(HttpMethod::Get, path);
-        request.query = query;
-        let response = self.transport.send(request)?;
+        let response = self.transport.send_to(request, dest)?;
         check_response(&response)?;
         Ok(response)
     }
@@ -236,14 +281,6 @@ impl<T: Transport> ApiClient<T> {
         request.json_body = Some(body);
         let response = self.transport.send(request)?;
         self.decode_json_response(response)
-    }
-
-    pub fn post_json_raw(&self, path: &str, body: Value) -> Result<ResponseData, AppError> {
-        let mut request = RequestData::new(HttpMethod::Post, path);
-        request.json_body = Some(body);
-        let response = self.transport.send(request)?;
-        check_response(&response)?;
-        Ok(response)
     }
 
     pub fn post_multipart(

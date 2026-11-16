@@ -626,3 +626,29 @@ fn push_line(bytes: &mut Vec<u8>, line: &str) {
     bytes.extend_from_slice(line.as_bytes());
     bytes.push(b'\n');
 }
+
+#[test]
+fn timeout_flag_aborts_a_stalled_request() {
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/api/documents/42/");
+        then.status(200)
+            .delay(std::time::Duration::from_secs(5))
+            .header("content-type", "application/json")
+            .body(r#"{"id":42,"content":"late"}"#);
+    });
+
+    let (_dir, config, session) = base_env();
+    let started = std::time::Instant::now();
+    let output = Command::new(env!("CARGO_BIN_EXE_paperless"))
+        .env("PAPERLESS_CONFIG_PATH", &config)
+        .env("PAPERLESS_SESSION_PATH", &session)
+        .env("PAPERLESS_URL", server.base_url())
+        .env("PAPERLESS_TOKEN", "env-token")
+        .args(["--timeout", "1", "document", "content", "42"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(started.elapsed() < std::time::Duration::from_secs(4));
+}
