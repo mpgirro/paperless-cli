@@ -109,7 +109,7 @@ pub struct UpdateRequest {
     pub custom_fields: Option<Value>,
 }
 
-/// Operations for `documents/bulk_edit/`. `Some(None)` clears the field.
+/// Operations for `document bulk`. `Some(None)` clears the field.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct BulkEditRequest {
     pub add_tags: Vec<u64>,
@@ -120,13 +120,22 @@ pub struct BulkEditRequest {
     pub reprocess: bool,
 }
 
+/// A `None` list is left out of the request, so Paperless keeps that slot as it is.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct BulkPermissions {
     pub owner: Option<u64>,
-    pub view_users: Vec<u64>,
-    pub view_groups: Vec<u64>,
-    pub change_users: Vec<u64>,
-    pub change_groups: Vec<u64>,
+    pub view_users: Option<Vec<u64>>,
+    pub view_groups: Option<Vec<u64>>,
+    pub change_users: Option<Vec<u64>>,
+    pub change_groups: Option<Vec<u64>>,
+}
+
+/// One request of `document bulk`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct BulkOperation {
+    pub method: &'static str,
+    pub path: &'static str,
+    pub body: Value,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -639,72 +648,107 @@ pub fn bulk_download_zip<T: Transport>(
     Ok(output_path.to_path_buf())
 }
 
-/// One `bulk_edit` body per method, in the order tags, correspondent, document type,
-/// permissions, reprocess.
-pub fn bulk_edit_bodies(
+/// One request per method, in the order tags, correspondent, document type, permissions,
+/// reprocess. Duplicate IDs are dropped because Paperless rejects them.
+pub fn bulk_operations(
     document_ids: &[u64],
     request: &BulkEditRequest,
-) -> Result<Vec<Value>, AppError> {
-    if document_ids.is_empty() {
+) -> Result<Vec<BulkOperation>, AppError> {
+    let documents = unique(document_ids);
+    if documents.is_empty() {
         return Err(AppError::Message("No document IDs given.".to_string()));
     }
-    let mut operations = Vec::new();
-    match (request.add_tags.as_slice(), request.remove_tags.as_slice()) {
+    let mut edits = Vec::new();
+    let add = unique(&request.add_tags);
+    let remove = unique(&request.remove_tags);
+    match (add.as_slice(), remove.as_slice()) {
         ([], []) => {}
-        ([tag], []) => operations.push(("add_tag", json!({ "tag": tag }))),
-        ([], [tag]) => operations.push(("remove_tag", json!({ "tag": tag }))),
-        (add, remove) => operations.push((
+        ([tag], []) => edits.push(("add_tag", json!({ "tag": tag }))),
+        ([], [tag]) => edits.push(("remove_tag", json!({ "tag": tag }))),
+        (add, remove) => edits.push((
             "modify_tags",
             json!({ "add_tags": add, "remove_tags": remove }),
         )),
     }
     if let Some(correspondent) = request.correspondent {
-        operations.push((
+        edits.push((
             "set_correspondent",
             json!({ "correspondent": correspondent }),
         ));
     }
     if let Some(document_type) = request.document_type {
-        operations.push((
+        edits.push((
             "set_document_type",
             json!({ "document_type": document_type }),
         ));
     }
     if let Some(permissions) = &request.permissions {
-        operations.push((
+        let mut set_permissions = Map::new();
+        for (action, users, groups) in [
+            ("view", &permissions.view_users, &permissions.view_groups),
+            (
+                "change",
+                &permissions.change_users,
+                &permissions.change_groups,
+            ),
+        ] {
+            let mut entry = Map::new();
+            if let Some(users) = users {
+                entry.insert("users".to_string(), json!(unique(users)));
+            }
+            if let Some(groups) = groups {
+                entry.insert("groups".to_string(), json!(unique(groups)));
+            }
+            if !entry.is_empty() {
+                set_permissions.insert(action.to_string(), Value::Object(entry));
+            }
+        }
+        edits.push((
             "set_permissions",
             json!({
-                "set_permissions": {
-                    "view": {"users": permissions.view_users, "groups": permissions.view_groups},
-                    "change": {"users": permissions.change_users, "groups": permissions.change_groups},
-                },
+                "set_permissions": set_permissions,
                 "owner": permissions.owner,
                 "merge": false,
             }),
         ));
     }
+    let mut operations = edits
+        .into_iter()
+        .map(|(method, parameters)| BulkOperation {
+            method,
+            path: "documents/bulk_edit/",
+            body: json!({ "documents": documents, "method": method, "parameters": parameters }),
+        })
+        .collect::<Vec<_>>();
+    // bulk_edit's `reprocess` method is deprecated in favour of this endpoint.
     if request.reprocess {
-        operations.push(("reprocess", json!({})));
+        operations.push(BulkOperation {
+            method: "reprocess",
+            path: "documents/reprocess/",
+            body: json!({ "documents": documents }),
+        });
     }
     if operations.is_empty() {
         return Err(AppError::Message("No bulk operation given.".to_string()));
     }
-    Ok(operations
-        .into_iter()
-        .map(|(method, parameters)| {
-            json!({ "documents": document_ids, "method": method, "parameters": parameters })
-        })
-        .collect())
+    Ok(operations)
 }
 
-/// Sends each body in turn and stops at the first failure.
-pub fn bulk_edit<T: Transport>(client: &ApiClient<T>, bodies: &[Value]) -> Result<Value, AppError> {
+fn unique(ids: &[u64]) -> Vec<u64> {
+    let mut seen = std::collections::HashSet::new();
+    ids.iter().copied().filter(|id| seen.insert(*id)).collect()
+}
+
+/// Sends each request in turn and stops at the first failure.
+pub fn bulk_edit<T: Transport>(
+    client: &ApiClient<T>,
+    operations: &[BulkOperation],
+) -> Result<Value, AppError> {
     let mut applied: Vec<&str> = Vec::new();
     let mut results = Vec::new();
-    for body in bodies {
-        let method = body["method"].as_str().unwrap_or_default();
+    for operation in operations {
         let response = client
-            .post_json("documents/bulk_edit/", body.clone())
+            .post_json(operation.path, operation.body.clone())
             .map_err(|error| {
                 let applied = if applied.is_empty() {
                     "none".to_string()
@@ -712,11 +756,12 @@ pub fn bulk_edit<T: Transport>(client: &ApiClient<T>, bodies: &[Value]) -> Resul
                     applied.join(", ")
                 };
                 AppError::Message(format!(
-                    "bulk_edit {method} failed (already applied: {applied}): {error}"
+                    "{} failed (already applied: {applied}): {error}",
+                    operation.method
                 ))
             })?;
-        applied.push(method);
-        results.push(json!({ "method": method, "response": response }));
+        applied.push(operation.method);
+        results.push(json!({ "method": operation.method, "response": response }));
     }
     Ok(Value::Array(results))
 }

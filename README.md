@@ -113,12 +113,13 @@ paperless document update 42 --no-correspondent --no-tags
 
 ### Bulk edits
 
-`document bulk` changes many documents through `documents/bulk_edit/`. It sends
-one request per method, in this order: tags (`add_tag`, `remove_tag`, or one
-`modify_tags` when several tags change), `set_correspondent`,
-`set_document_type`, `set_permissions`, `reprocess`. It stops at the first
-failed request and names the methods already applied. `-` reads IDs from stdin.
-`--dry-run` prints the request bodies and sends nothing.
+`document bulk` changes many documents at once. It sends one request per
+operation, in this order: tags (`add_tag`, `remove_tag`, or one `modify_tags`
+when several tags change), `set_correspondent`, `set_document_type` and
+`set_permissions` through `documents/bulk_edit/`, then `documents/reprocess/`.
+It stops at the first failed request and names the operations already applied.
+`-` reads IDs from stdin. Duplicate IDs are dropped. `--dry-run` prints the
+requests and sends nothing.
 
 ```sh
 paperless document bulk 1 2 3 --add-tag 5 --remove-tag 7
@@ -127,8 +128,11 @@ paperless document list --json | jq '.data.results[].id' | paperless document bu
 paperless document bulk 1 --set-permissions --owner 2 --view-groups 3,4 --dry-run
 ```
 
-`--set-permissions` replaces owner and permissions, so it needs `--owner`
-(`none` for no owner); lists not given become empty.
+`--set-permissions` sets the owner and needs `--owner`. `--owner none` leaves
+the documents without an owner, which makes them visible to all users. Each of
+`--view-users`, `--view-groups`, `--change-users` and `--change-groups` replaces
+that list; `none` empties it. A list not given stays as it is. Paperless keeps
+no history of permission changes, so check with `--dry-run` first.
 
 ### Raw API calls
 
