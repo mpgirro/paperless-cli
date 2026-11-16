@@ -610,7 +610,7 @@ pub fn bulk_download_zip<T: Transport>(
     part_path.push(".part");
     let part_path = PathBuf::from(part_path);
     download_to_file(client, request, &part_path)?;
-    std::fs::rename(&part_path, output_path)?;
+    finish_part(&part_path, output_path)?;
     Ok(output_path.to_path_buf())
 }
 
@@ -842,8 +842,15 @@ fn download_asset<T: Transport>(
         .map(|value| sanitize_filename(&value))
         .unwrap_or_else(|| format!("document_{document_id}_{asset}.bin"));
     let output_path = output_dir.join(filename);
-    std::fs::rename(&part_path, &output_path)?;
+    finish_part(&part_path, &output_path)?;
     Ok(output_path)
+}
+
+fn finish_part(part_path: &Path, output_path: &Path) -> Result<(), AppError> {
+    std::fs::rename(part_path, output_path).inspect_err(|_| {
+        let _ = std::fs::remove_file(part_path);
+    })?;
+    Ok(())
 }
 
 fn download_to_file<T: Transport>(

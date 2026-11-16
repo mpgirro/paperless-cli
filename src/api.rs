@@ -95,16 +95,32 @@ pub trait Transport {
 pub struct ReqwestTransport {
     config: AppConfig,
     client: reqwest::blocking::Client,
+    upload_client: reqwest::blocking::Client,
 }
 
 impl ReqwestTransport {
     pub fn new(config: AppConfig) -> Result<Self, AppError> {
+        // Blocking reqwest applies the client timeout to each wait: for the
+        // response headers, then for every body read. A download that keeps
+        // receiving data is therefore not cut off.
         let client = reqwest::blocking::Client::builder()
+            .timeout(config.http_timeout())
+            .connect_timeout(config.http_timeout())
+            .build()?;
+        // The wait for the response headers includes sending the body, so an
+        // upload gets only the connect timeout.
+        // shortcut: a server that stalls after connecting hangs an upload; switch
+        // to the async client's read_timeout if that happens in practice.
+        let upload_client = reqwest::blocking::Client::builder()
             .timeout(None)
             .connect_timeout(config.http_timeout())
             .build()?;
 
-        Ok(Self { config, client })
+        Ok(Self {
+            config,
+            client,
+            upload_client,
+        })
     }
 
     pub fn config(&self) -> &AppConfig {
@@ -114,18 +130,22 @@ impl ReqwestTransport {
 
 impl ReqwestTransport {
     fn execute(&self, request: RequestData) -> Result<reqwest::blocking::Response, AppError> {
-        let is_upload = request.multipart_file.is_some();
+        let client = if request.multipart_file.is_some() {
+            &self.upload_client
+        } else {
+            &self.client
+        };
         let url = match request.endpoint {
             Endpoint::Relative(path) => self.config.api_url(&path),
             Endpoint::Absolute(url) => url,
         };
 
         let mut builder = match request.method {
-            HttpMethod::Get => self.client.get(&url),
-            HttpMethod::Post => self.client.post(&url),
-            HttpMethod::Patch => self.client.patch(&url),
-            HttpMethod::Put => self.client.put(&url),
-            HttpMethod::Delete => self.client.delete(&url),
+            HttpMethod::Get => client.get(&url),
+            HttpMethod::Post => client.post(&url),
+            HttpMethod::Patch => client.patch(&url),
+            HttpMethod::Put => client.put(&url),
+            HttpMethod::Delete => client.delete(&url),
         }
         .header("Authorization", format!("Token {}", self.config.token))
         .header("Accept", "application/json");
@@ -148,14 +168,6 @@ impl ReqwestTransport {
                 .map_err(|error| AppError::Message(error.to_string()))?;
             form = form.part(file.field_name, part);
             builder = builder.multipart(form);
-        }
-
-        // Blocking reqwest also applies this timeout to each body read, so a
-        // streamed download fails only when idle, not when it is merely long.
-        // shortcut: uploads get only the connect timeout, since blocking reqwest has
-        // no write-idle timeout; switch to the async client if stalled uploads hang.
-        if let (false, Some(timeout)) = (is_upload, self.config.http_timeout()) {
-            builder = builder.timeout(timeout);
         }
 
         Ok(builder.send()?)

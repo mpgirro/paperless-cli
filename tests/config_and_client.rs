@@ -617,3 +617,45 @@ fn reqwest_download_streams_body_to_named_file() {
     names.sort();
     assert_eq!(names, vec!["scan.pdf"]);
 }
+
+#[test]
+fn reqwest_download_outlasts_timeout_while_data_keeps_flowing() {
+    use std::io::{Read, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = stream.read(&mut buf).unwrap();
+            request.extend_from_slice(&buf[..read]);
+        }
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\
+                  Content-Disposition: attachment; filename=\"slow.pdf\"\r\n\r\n",
+            )
+            .unwrap();
+        for _ in 0..8 {
+            std::thread::sleep(Duration::from_millis(300));
+            stream.write_all(b"x").unwrap();
+            stream.flush().unwrap();
+        }
+    });
+
+    let temp = tempdir().unwrap();
+    let mut config = AppConfig::new(
+        format!("http://127.0.0.1:{port}"),
+        "token",
+        OutputMode::Json,
+    )
+    .unwrap();
+    config.timeout = Some(1);
+    let client = ApiClient::new(ReqwestTransport::new(config).unwrap());
+
+    let saved = services::download_document(&client, 1, temp.path(), false).unwrap();
+    assert_eq!(std::fs::read(saved).unwrap(), b"xxxxxxxx");
+    server.join().unwrap();
+}

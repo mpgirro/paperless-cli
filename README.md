@@ -57,9 +57,11 @@ paperless dashboard
 ```
 
 Set the HTTP timeout in seconds with `--timeout` or a `timeout` key in the
-config file. The default is 30; `0` disables it. Downloads stream to disk and
-fail only when the server stops sending data for that long. Uploads use the
-timeout only for connecting:
+config file. The default is 30; `0` disables it. It bounds connecting, the wait
+for a response, and each pause while a response body arrives, so a long
+download that keeps receiving data is not cut off. Downloads stream to disk.
+Uploads use the timeout only for connecting: a server that stalls after the
+upload has started is not detected.
 
 ```bash
 paperless --timeout 120 document upload scan.pdf
