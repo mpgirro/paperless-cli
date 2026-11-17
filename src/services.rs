@@ -881,7 +881,11 @@ impl Write for JsonOrRaw<'_> {
         }
         match &mut self.json {
             Some(json) => json.extend_from_slice(data),
-            None => self.out.write_all(data)?,
+            // Stdout is line-buffered, so a binary body would otherwise wait for a newline.
+            None => {
+                self.out.write_all(data)?;
+                self.out.flush()?;
+            }
         }
         Ok(data.len())
     }

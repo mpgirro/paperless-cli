@@ -59,11 +59,14 @@ paperless dashboard
 Set the HTTP timeout in seconds with `--timeout` or a `timeout` key in the
 config file. The default is 30; `0` disables it. It bounds connecting, the wait
 for a response, and each pause while a response body arrives, so a long
-download that keeps receiving data is not cut off. Downloads stream to disk.
+download that keeps receiving data is not cut off. Downloads stream to disk
+through a `.paperless-<pid>-<n>.part` file in the destination folder; an
+interrupted download can leave one behind.
 An upload fails once neither the file nor the response has moved for the
 timeout, so a long upload is not cut off while data flows. After the last byte
-is sent, the server must answer within the timeout. The login token request
-uses the same timeout.
+is sent, the server must answer within the timeout. A timed-out upload may
+still have reached the server, so check before retrying. The login token
+request uses the same timeout.
 
 ```bash
 paperless --timeout 120 document upload scan.pdf
