@@ -245,3 +245,58 @@ fn empty_with_stdin_ids_requires_yes() {
     assert!(stderr.contains("IDs from stdin need --yes"), "{stderr}");
     any.assert_calls(0);
 }
+
+#[test]
+fn a_redirected_write_fails_instead_of_turning_into_a_get() {
+    for (action, args) in [
+        ("empty", vec!["empty", "5", "--yes"]),
+        ("restore", vec!["restore", "5"]),
+    ] {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/api/trash/");
+            then.status(302).header("location", "/api/trash/");
+        });
+        let get = server.mock(|when, then| {
+            when.method(GET).path("/api/trash/");
+            then.status(200).body(r#"{"next":null,"results":[]}"#);
+        });
+
+        let output = run_paperless(
+            Some(&server),
+            &[&["--json", "trash"], args.as_slice()].concat(),
+            None,
+        );
+
+        assert!(!output.status.success(), "{action} reported success");
+        get.assert_calls(0);
+    }
+}
+
+#[test]
+fn pagination_after_a_redirect_never_sends_the_token_to_the_other_host() {
+    let other = MockServer::start();
+    let leaked = other.mock(|when, then| {
+        when.header_exists("authorization");
+        then.status(200).body(r#"{"next":null,"results":[]}"#);
+    });
+    let next = other.url("/api/trash/?page=2");
+    other.mock(|when, then| {
+        when.method(GET)
+            .path("/api/trash/")
+            .query_param_missing("page");
+        then.status(200)
+            .body(json!({"next": next, "results": []}).to_string());
+    });
+    let server = MockServer::start();
+    let target = other.url("/api/trash/");
+    server.mock(|when, then| {
+        when.method(GET).path("/api/trash/");
+        then.status(302).header("location", target.as_str());
+    });
+
+    let output = run_paperless(Some(&server), &["--json", "trash", "list"], None);
+
+    assert!(!output.status.success());
+    leaked.assert_calls(0);
+}

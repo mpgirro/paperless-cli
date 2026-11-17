@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{Cursor, Read, Write};
 use std::path::Path;
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use reqwest::blocking::multipart::{Form, Part};
 use serde_json::{json, Value};
@@ -39,7 +41,6 @@ pub struct RequestData {
     pub json_body: Option<Value>,
     pub multipart_fields: Vec<(String, String)>,
     pub multipart_file: Option<MultipartFile>,
-    pub follow_redirects: bool,
 }
 
 impl RequestData {
@@ -51,7 +52,6 @@ impl RequestData {
             json_body: None,
             multipart_fields: Vec::new(),
             multipart_file: None,
-            follow_redirects: true,
         }
     }
 
@@ -63,7 +63,6 @@ impl RequestData {
             json_body: None,
             multipart_fields: Vec::new(),
             multipart_file: None,
-            follow_redirects: true,
         }
     }
 }
@@ -77,6 +76,9 @@ pub struct ResponseData {
 }
 
 pub trait Transport {
+    /// The configured server; `next` links must stay on its origin.
+    fn base_url(&self) -> &str;
+
     fn send(&self, request: RequestData) -> Result<ResponseData, AppError>;
 
     /// Writes a successful response body to `dest` instead of `ResponseData::body`.
@@ -112,12 +114,11 @@ impl ReqwestTransport {
             .connect_timeout(config.http_timeout())
             .build()?;
         // The wait for the response headers includes sending the body, so an
-        // upload gets only the connect timeout.
-        // shortcut: a server that stalls after connecting hangs an upload; switch
-        // to the async client's read_timeout if that happens in practice.
+        // upload gets no client timeout; `send_upload` enforces an idle timeout.
         let upload_client = reqwest::blocking::Client::builder()
             .timeout(None)
             .connect_timeout(config.http_timeout())
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
         let no_redirect_client = reqwest::blocking::Client::builder()
             .timeout(config.http_timeout())
@@ -140,12 +141,21 @@ impl ReqwestTransport {
 
 impl ReqwestTransport {
     fn execute(&self, request: RequestData) -> Result<reqwest::blocking::Response, AppError> {
+        Ok(self.builder(request, None)?.send()?)
+    }
+
+    fn builder(
+        &self,
+        request: RequestData,
+        progress: Option<Arc<Mutex<Instant>>>,
+    ) -> Result<reqwest::blocking::RequestBuilder, AppError> {
+        // A followed 301/302 turns a write into a GET and loses it.
         let client = if request.multipart_file.is_some() {
             &self.upload_client
-        } else if !request.follow_redirects {
-            &self.no_redirect_client
-        } else {
+        } else if request.method == HttpMethod::Get {
             &self.client
+        } else {
+            &self.no_redirect_client
         };
         let url = match request.endpoint {
             Endpoint::Relative(path) => self.config.api_url(&path),
@@ -174,7 +184,12 @@ impl ReqwestTransport {
                 form = form.text(key, value);
             }
 
-            let part = Part::bytes(file.bytes)
+            let length = file.bytes.len() as u64;
+            let reader = ProgressReader {
+                inner: Cursor::new(file.bytes),
+                progress: progress.unwrap_or_else(|| Arc::new(Mutex::new(Instant::now()))),
+            };
+            let part = Part::reader_with_length(reader, length)
                 .file_name(file.file_name)
                 .mime_str(&file.mime)
                 .map_err(|error| AppError::Message(error.to_string()))?;
@@ -182,8 +197,67 @@ impl ReqwestTransport {
             builder = builder.multipart(form);
         }
 
-        Ok(builder.send()?)
+        Ok(builder)
     }
+
+    /// Fails once neither the request body nor the response has moved for the timeout.
+    fn send_upload(&self, request: RequestData) -> Result<ResponseData, AppError> {
+        let progress = Arc::new(Mutex::new(Instant::now()));
+        let builder = self.builder(request, Some(progress.clone()))?;
+        let Some(timeout) = self.config.http_timeout() else {
+            return read_response(builder.send()?);
+        };
+        let (sender, receiver) = mpsc::channel();
+        // On timeout the thread is abandoned; it ends with the process.
+        std::thread::spawn(move || {
+            let _ = sender.send(
+                builder
+                    .send()
+                    .map_err(AppError::from)
+                    .and_then(read_response),
+            );
+        });
+        loop {
+            let idle = progress
+                .lock()
+                .map(|last| last.elapsed())
+                .unwrap_or_default();
+            if idle >= timeout {
+                return Err(AppError::Message(format!(
+                    "Upload timed out: no progress for {} seconds.",
+                    timeout.as_secs()
+                )));
+            }
+            match receiver.recv_timeout(timeout - idle) {
+                Ok(result) => return result,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(AppError::Message("Upload thread failed.".to_string()))
+                }
+            }
+        }
+    }
+}
+
+struct ProgressReader {
+    inner: Cursor<Vec<u8>>,
+    progress: Arc<Mutex<Instant>>,
+}
+
+impl Read for ProgressReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        if let Ok(mut last) = self.progress.lock() {
+            *last = Instant::now();
+        }
+        Ok(read)
+    }
+}
+
+fn read_response(response: reqwest::blocking::Response) -> Result<ResponseData, AppError> {
+    let mut data = response_head(&response);
+    data.body = response.bytes()?.to_vec();
+    Ok(data)
 }
 
 fn response_head(response: &reqwest::blocking::Response) -> ResponseData {
@@ -205,11 +279,15 @@ fn response_head(response: &reqwest::blocking::Response) -> ResponseData {
 }
 
 impl Transport for ReqwestTransport {
+    fn base_url(&self) -> &str {
+        &self.config.base_url
+    }
+
     fn send(&self, request: RequestData) -> Result<ResponseData, AppError> {
-        let response = self.execute(request)?;
-        let mut data = response_head(&response);
-        data.body = response.bytes()?.to_vec();
-        Ok(data)
+        if request.multipart_file.is_some() {
+            return self.send_upload(request);
+        }
+        read_response(self.execute(request)?)
     }
 
     fn send_to(
@@ -228,9 +306,15 @@ impl Transport for ReqwestTransport {
     }
 }
 
-pub fn fetch_token(base_url: &str, username: &str, password: &str) -> Result<String, AppError> {
+pub fn fetch_token(
+    base_url: &str,
+    username: &str,
+    password: &str,
+    timeout: Option<Duration>,
+) -> Result<String, AppError> {
     let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
+        .timeout(timeout)
+        .connect_timeout(timeout)
         .build()?;
     let url = format!("{}/api/token/", base_url.trim_end_matches('/'));
     let response = client
@@ -334,9 +418,13 @@ impl<T: Transport> ApiClient<T> {
         self.decode_json_response(response)
     }
 
-    /// Like the typed helpers, but a non-2xx error carries the raw response body.
-    pub fn send_raw(&self, request: RequestData) -> Result<ResponseData, AppError> {
-        let response = self.transport.send(request)?;
+    /// Like `download`, but a non-2xx error carries the raw response body.
+    pub fn send_raw_to(
+        &self,
+        request: RequestData,
+        dest: &mut dyn Write,
+    ) -> Result<ResponseData, AppError> {
+        let response = self.transport.send_to(request, dest)?;
         check_raw_response(&response)?;
         Ok(response)
     }
@@ -378,6 +466,7 @@ impl<T: Transport> ApiClient<T> {
             query.push(("page_size".to_string(), "100".to_string()));
         }
 
+        let base_url = self.transport.base_url();
         let mut next = Some(Endpoint::Relative(path.to_string()));
         let mut params = query;
         let mut results = Vec::new();
@@ -419,7 +508,7 @@ impl<T: Transport> ApiClient<T> {
             next = response_object
                 .get("next")
                 .and_then(Value::as_str)
-                .map(|url| validate_next_page_url(&current_url, url))
+                .map(|url| validate_next_page_url(base_url, url))
                 .transpose()?
                 .map(Endpoint::Absolute);
             params.clear();
@@ -463,20 +552,20 @@ impl<T: Transport> ApiClient<T> {
     }
 }
 
-fn validate_next_page_url(current_url: &str, next_url: &str) -> Result<String, AppError> {
-    let current = reqwest::Url::parse(current_url)
-        .map_err(|_| AppError::Message(format!("Invalid current pagination URL: {current_url}")))?;
+fn validate_next_page_url(base_url: &str, next_url: &str) -> Result<String, AppError> {
+    let base = reqwest::Url::parse(base_url)
+        .map_err(|_| AppError::Message(format!("Invalid base URL: {base_url}")))?;
     let next = reqwest::Url::parse(next_url)
         .map_err(|_| AppError::Message(format!("Invalid pagination URL: {next_url}")))?;
 
-    if current.host_str() != next.host_str() {
+    if base.host_str() != next.host_str() {
         return Err(AppError::Message(format!(
             "Refusing cross-origin pagination link: {next_url}"
         )));
     }
 
-    if current.scheme() == next.scheme() {
-        if current.port_or_known_default() != next.port_or_known_default() {
+    if base.scheme() == next.scheme() {
+        if base.port_or_known_default() != next.port_or_known_default() {
             return Err(AppError::Message(format!(
                 "Refusing cross-origin pagination link: {next_url}"
             )));
@@ -484,13 +573,13 @@ fn validate_next_page_url(current_url: &str, next_url: &str) -> Result<String, A
         return Ok(next_url.to_string());
     }
 
-    if next.port().is_some() && current.port_or_known_default() != next.port_or_known_default() {
+    if next.port().is_some() && base.port_or_known_default() != next.port_or_known_default() {
         return Err(AppError::Message(format!(
             "Refusing cross-origin pagination link: {next_url}"
         )));
     }
 
-    let mut normalized = current;
+    let mut normalized = base;
     normalized.set_path(next.path());
     normalized.set_query(next.query());
     normalized.set_fragment(next.fragment());

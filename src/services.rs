@@ -1,4 +1,7 @@
+use std::fs::{File, OpenOptions};
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Serialize;
 use serde_json::{json, Map, Value};
@@ -8,8 +11,8 @@ use crate::api::{
     Transport,
 };
 use crate::config::{
-    load_config, load_session, normalize_url, save_config, save_session, AppConfig, AppPaths,
-    OutputMode, SessionState,
+    load_config, load_session, normalize_url, save_config, save_session, timeout_duration,
+    AppConfig, AppPaths, OutputMode, SessionState,
 };
 use crate::error::AppError;
 use crate::security::{AuditState, SecurityFinding};
@@ -188,27 +191,31 @@ pub fn init_connection<T: Transport>(
     paths: &AppPaths,
     base_url: &str,
     token: Option<String>,
-    username: Option<String>,
-    password: Option<String>,
+    credentials: Option<(String, String)>,
     preferred_output: OutputMode,
+    timeout: Option<u64>,
 ) -> Result<AppConfig, AppError> {
     let normalized = normalize_url(base_url)?;
+    let saved_timeout = load_config(paths)
+        .ok()
+        .and_then(|existing| existing.timeout);
+    let timeout = timeout.or(saved_timeout);
     let token = match token {
         Some(token) => token,
         None => {
-            let username = username.ok_or(AppError::MissingCredentials)?;
-            let password = password.ok_or(AppError::MissingCredentials)?;
-            fetch_token(&normalized, &username, &password)?
+            let (username, password) = credentials.ok_or(AppError::MissingCredentials)?;
+            fetch_token(&normalized, &username, &password, timeout_duration(timeout))?
         }
     };
 
     let config = AppConfig {
-        timeout: load_config(paths)
-            .ok()
-            .and_then(|existing| existing.timeout),
+        timeout: saved_timeout,
         ..AppConfig::new(normalized, token, preferred_output)?
     };
-    let client = client_factory(config.clone())?;
+    let client = client_factory(AppConfig {
+        timeout,
+        ..config.clone()
+    })?;
     client.ping(&config.base_url)?;
     save_config(paths, &config)?;
     Ok(config)
@@ -640,10 +647,11 @@ pub fn bulk_download_zip<T: Transport>(
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut part_path = output_path.as_os_str().to_owned();
-    part_path.push(".part");
-    let part_path = PathBuf::from(part_path);
-    download_to_file(client, request, &part_path)?;
+    let dir = match output_path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let (_, part_path) = download_to_file(client, request, dir)?;
     finish_part(&part_path, output_path)?;
     Ok(output_path.to_path_buf())
 }
@@ -798,8 +806,8 @@ pub fn trash_action<T: Transport>(
     )
 }
 
-/// Raw call for `paperless api`; returns the bytes to print. With `all`, a GET follows
-/// `next` links and returns the merged `results`.
+/// Raw call for `paperless api`; writes the response to `out`. With `all`, a GET follows
+/// `next` links and writes the merged `results`.
 pub fn api_passthrough<T: Transport>(
     client: &ApiClient<T>,
     method: HttpMethod,
@@ -807,7 +815,8 @@ pub fn api_passthrough<T: Transport>(
     query: Vec<(String, String)>,
     body: Option<Value>,
     all: bool,
-) -> Result<Vec<u8>, AppError> {
+    out: &mut dyn Write,
+) -> Result<(), AppError> {
     let path = with_trailing_slash(path);
     if all {
         if method != HttpMethod::Get || body.is_some() {
@@ -815,22 +824,70 @@ pub fn api_passthrough<T: Transport>(
                 "--all works only with GET and without --data".to_string(),
             ));
         }
-        return pretty_json(&Value::Array(client.paginate_raw(&path, query)?));
+        let results = pretty_json(&Value::Array(client.paginate_raw(&path, query)?))?;
+        return Ok(out.write_all(&results)?);
     }
-    let follow_redirects = method == HttpMethod::Get;
     let mut request = RequestData::new(method, path);
     request.query = query;
     request.json_body = body;
-    // A followed 301/302 turns a write into a GET and loses it.
-    request.follow_redirects = follow_redirects;
-    let response = client.send_raw(request)?;
-    if response.body.is_empty() {
-        return pretty_json(&json!({}));
+    let mut body = JsonOrRaw {
+        out,
+        json: None,
+        streaming: false,
+    };
+    client.send_raw_to(request, &mut body)?;
+    body.finish()
+}
+
+/// Streams a body to `out`, except one that may be JSON: that is buffered to pretty-print it.
+struct JsonOrRaw<'a> {
+    out: &'a mut dyn Write,
+    json: Option<Vec<u8>>,
+    streaming: bool,
+}
+
+impl JsonOrRaw<'_> {
+    fn finish(self) -> Result<(), AppError> {
+        if self.streaming {
+            return Ok(self.out.flush()?);
+        }
+        let body = self.json.unwrap_or_default();
+        let bytes = if body.is_empty() {
+            pretty_json(&json!({}))?
+        } else {
+            match serde_json::from_slice::<Value>(&body) {
+                Ok(value) => pretty_json(&value)?,
+                // The request succeeded, so print the body as is rather than fail and invite a retry.
+                Err(_) => body,
+            }
+        };
+        self.out.write_all(&bytes)?;
+        Ok(self.out.flush()?)
     }
-    match serde_json::from_slice::<Value>(&response.body) {
-        Ok(value) => pretty_json(&value),
-        // The request succeeded, so print the body as is rather than fail and invite a retry.
-        Err(_) => Ok(response.body),
+}
+
+impl Write for JsonOrRaw<'_> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if !self.streaming && self.json.is_none() {
+            match data.first() {
+                None => return Ok(0),
+                Some(byte)
+                    if byte.is_ascii_whitespace() || b"{[\"-0123456789tfn".contains(byte) =>
+                {
+                    self.json = Some(Vec::new())
+                }
+                Some(_) => self.streaming = true,
+            }
+        }
+        match &mut self.json {
+            Some(json) => json.extend_from_slice(data),
+            None => self.out.write_all(data)?,
+        }
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.out.flush()
     }
 }
 
@@ -1071,8 +1128,7 @@ fn download_asset<T: Transport>(
         RequestData::new(HttpMethod::Get, format!("documents/{document_id}/{asset}/"));
     request.query = params;
     std::fs::create_dir_all(output_dir)?;
-    let part_path = output_dir.join(format!(".document_{document_id}_{asset}.part"));
-    let response = download_to_file(client, request, &part_path)?;
+    let (response, part_path) = download_to_file(client, request, output_dir)?;
 
     let filename = response
         .headers
@@ -1092,18 +1148,35 @@ fn finish_part(part_path: &Path, output_path: &Path) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Streams into a new temp file in `dir` and returns it; the caller renames it into place.
 fn download_to_file<T: Transport>(
     client: &ApiClient<T>,
     request: RequestData,
-    part_path: &Path,
-) -> Result<ResponseData, AppError> {
-    let result = std::fs::File::create(part_path)
-        .map_err(AppError::from)
-        .and_then(|mut file| client.download(request, &mut file));
-    if result.is_err() {
-        let _ = std::fs::remove_file(part_path);
+    dir: &Path,
+) -> Result<(ResponseData, PathBuf), AppError> {
+    let (mut file, part_path) = create_part_file(dir)?;
+    match client.download(request, &mut file) {
+        Ok(response) => Ok((response, part_path)),
+        Err(error) => {
+            drop(file);
+            let _ = std::fs::remove_file(&part_path);
+            Err(error)
+        }
     }
-    result
+}
+
+// `create_new` never follows a planted symlink or reuses a file another download writes to.
+fn create_part_file(dir: &Path) -> Result<(File, PathBuf), AppError> {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    loop {
+        let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!(".paperless-{}-{count}.part", std::process::id()));
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => return Ok((file, path)),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
 }
 
 fn extract_download_filename(content_disposition: &str) -> Option<String> {

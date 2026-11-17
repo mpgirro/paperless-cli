@@ -46,6 +46,10 @@ impl MockTransport {
 }
 
 impl Transport for MockTransport {
+    fn base_url(&self) -> &str {
+        "https://paperless.example.com"
+    }
+
     fn send(&self, request: RequestData) -> Result<ResponseData, AppError> {
         self.requests.lock().unwrap().push(request);
         self.responses
@@ -586,36 +590,144 @@ fn load_config_reads_timeout_key_and_zero_disables_it() {
     assert_eq!(loaded.http_timeout(), None);
 }
 
-#[test]
-fn reqwest_upload_is_not_cut_off_by_the_total_timeout() {
-    let server = MockServer::start();
-    let upload = server.mock(|when, then| {
-        when.method(POST).path("/api/documents/post_document/");
-        then.status(200)
-            .delay(Duration::from_secs(2))
-            .header("content-type", "application/json")
-            .body(r#""task-id""#);
-    });
-    let temp = tempdir().unwrap();
-    let file_path = temp.path().join("scan.pdf");
-    std::fs::write(&file_path, b"%PDF fake").unwrap();
+fn upload_request(dir: &std::path::Path, bytes: &[u8]) -> UploadRequest {
+    let path = dir.join("scan.pdf");
+    std::fs::write(&path, bytes).unwrap();
+    UploadRequest {
+        path,
+        title: None,
+        correspondent_id: None,
+        document_type_id: None,
+        tag_ids: Vec::new(),
+    }
+}
 
-    let mut config = AppConfig::new(server.base_url(), "token", OutputMode::Json).unwrap();
-    config.timeout = Some(1);
-    let client = ApiClient::new(ReqwestTransport::new(config).unwrap());
-
-    services::upload_document(
-        &client,
-        &UploadRequest {
-            path: file_path,
-            title: None,
-            correspondent_id: None,
-            document_type_id: None,
-            tag_ids: Vec::new(),
-        },
+fn reqwest_client(port: u16, timeout: u64) -> ApiClient<ReqwestTransport> {
+    let mut config = AppConfig::new(
+        format!("http://127.0.0.1:{port}"),
+        "token",
+        OutputMode::Json,
     )
     .unwrap();
-    upload.assert_calls(1);
+    config.timeout = Some(timeout);
+    ApiClient::new(ReqwestTransport::new(config).unwrap())
+}
+
+#[test]
+fn reqwest_upload_outlasts_timeout_while_the_body_keeps_flowing() {
+    use std::io::{Read, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut received = Vec::new();
+        let header_end = loop {
+            let read = stream.read(&mut buf).unwrap();
+            received.extend_from_slice(&buf[..read]);
+            if let Some(pos) = received.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos + 4;
+            }
+        };
+        let head = String::from_utf8_lossy(&received[..header_end]).to_lowercase();
+        let length: usize = head
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let mut body = received.len() - header_end;
+        while body < length {
+            std::thread::sleep(Duration::from_millis(5));
+            body += stream.read(&mut buf).unwrap();
+        }
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\n\"task-id\"")
+            .unwrap();
+    });
+    let temp = tempdir().unwrap();
+    let client = reqwest_client(port, 1);
+
+    let started = std::time::Instant::now();
+    services::upload_document(&client, &upload_request(temp.path(), &vec![b'x'; 32 << 20]))
+        .unwrap();
+    assert!(started.elapsed() > Duration::from_secs(1));
+    server.join().unwrap();
+}
+
+#[test]
+fn reqwest_upload_fails_when_the_server_stalls() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let (_stream, _) = listener.accept().unwrap();
+        std::thread::sleep(Duration::from_secs(30));
+    });
+    let temp = tempdir().unwrap();
+    let client = reqwest_client(port, 1);
+
+    let started = std::time::Instant::now();
+    services::upload_document(&client, &upload_request(temp.path(), b"%PDF fake")).unwrap_err();
+    assert!(started.elapsed() < Duration::from_secs(10));
+}
+
+#[test]
+fn download_never_touches_a_file_at_the_old_part_name() {
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/api/documents/5/download/");
+        then.status(200)
+            .header("content-disposition", "attachment; filename=\"scan.pdf\"")
+            .body("new");
+    });
+    server.mock(|when, then| {
+        when.method(POST).path("/api/documents/bulk_download/");
+        then.status(404).body("{}");
+    });
+    let temp = tempdir().unwrap();
+    let victim = temp.path().join("victim");
+    std::fs::write(&victim, "keep").unwrap();
+    let part = temp.path().join(".document_5_download.part");
+    std::os::unix::fs::symlink(&victim, &part).unwrap();
+    let zip_part = temp.path().join("out.zip.part");
+    std::fs::write(&zip_part, "keep").unwrap();
+    let config = AppConfig::new(server.base_url(), "token", OutputMode::Json).unwrap();
+    let client = ApiClient::new(ReqwestTransport::new(config).unwrap());
+
+    let saved = services::download_document(&client, 5, temp.path(), false).unwrap();
+    services::bulk_download_zip(&client, &[5], &temp.path().join("out.zip"), "both").unwrap_err();
+
+    assert_eq!(std::fs::read(saved).unwrap(), b"new");
+    assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+    assert!(std::fs::symlink_metadata(&part)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(std::fs::read(&zip_part).unwrap(), b"keep");
+}
+
+#[test]
+fn download_removes_its_temp_file_when_the_body_breaks_off() {
+    use std::io::{Read, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 1024];
+        let _ = stream.read(&mut buf).unwrap();
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nonly ten b")
+            .unwrap();
+    });
+    let temp = tempdir().unwrap();
+    let client = reqwest_client(port, 5);
+
+    services::download_document(&client, 1, temp.path(), false).unwrap_err();
+    server.join().unwrap();
+    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
 }
 
 #[test]

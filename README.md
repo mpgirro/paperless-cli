@@ -60,8 +60,10 @@ Set the HTTP timeout in seconds with `--timeout` or a `timeout` key in the
 config file. The default is 30; `0` disables it. It bounds connecting, the wait
 for a response, and each pause while a response body arrives, so a long
 download that keeps receiving data is not cut off. Downloads stream to disk.
-Uploads use the timeout only for connecting: a server that stalls after the
-upload has started is not detected.
+An upload fails once neither the file nor the response has moved for the
+timeout, so a long upload is not cut off while data flows. After the last byte
+is sent, the server must answer within the timeout. The login token request
+uses the same timeout.
 
 ```bash
 paperless --timeout 120 document upload scan.pdf
@@ -165,10 +167,11 @@ paperless api GET trash/ --all
 ```
 
 `PATH` is relative to `/api/`; a missing trailing `/` is added. The response
-JSON goes to stdout, a non-JSON body as is. A non-2xx status exits non-zero with
-the response body on stderr. Only GET follows redirects, so a redirected write
-fails instead of turning into a GET. `--all` follows `next` links of a paginated
-GET and prints the merged `results` as one array.
+JSON goes to stdout, a non-JSON body streams as is. A non-2xx status exits
+non-zero with the response body on stderr. Only GET follows redirects, here and
+in every other command, so a redirected write fails instead of turning into a
+GET. `--all` follows `next` links of a paginated GET and prints the merged
+`results` as one array. A `next` link must stay on the configured server.
 
 ### Network behavior
 

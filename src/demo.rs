@@ -18,6 +18,10 @@ impl DemoTransport {
 }
 
 impl Transport for DemoTransport {
+    fn base_url(&self) -> &str {
+        DEMO_BASE_URL
+    }
+
     fn send(&self, request: RequestData) -> Result<ResponseData, AppError> {
         let (path, query) = match request.endpoint {
             Endpoint::Relative(path) => (path, request.query),

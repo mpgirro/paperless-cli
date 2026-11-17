@@ -43,7 +43,7 @@ struct Cli {
     no_color: bool,
     #[arg(short = 'u', long, global = true)]
     url: Option<String>,
-    /// HTTP timeout in seconds (default 30, 0 disables it). Uploads use it only for connecting.
+    /// HTTP timeout in seconds (default 30, 0 disables it). Uploads time out only when stalled.
     #[arg(long, global = true, value_name = "SECS")]
     timeout: Option<u64>,
     #[arg(long, global = true, default_value_t = false)]
@@ -427,15 +427,19 @@ fn run_trash<T: Transport>(
             }
             let ids = unique(&read_document_ids(&args.documents.ids)?);
             if !ids.is_empty() && !args.yes {
-                confirm_empty_trash(&ids)?;
+                confirm_empty_trash(&ids, io::stdin().is_terminal(), &mut io::stdin().lock())?;
             }
             Ok(("trash empty", trash_action(client, "empty", &ids)?))
         }
     }
 }
 
-fn confirm_empty_trash(ids: &[u64]) -> Result<(), AppError> {
-    if !io::stdin().is_terminal() {
+fn confirm_empty_trash(
+    ids: &[u64],
+    is_terminal: bool,
+    input: &mut dyn io::BufRead,
+) -> Result<(), AppError> {
+    if !is_terminal {
         return Err(AppError::Message(
             "Refusing to empty the trash without --yes: stdin is not a terminal.".to_string(),
         ));
@@ -448,7 +452,7 @@ fn confirm_empty_trash(ids: &[u64]) -> Result<(), AppError> {
     eprint!("Permanently delete documents {list}? This cannot be undone. [y/N] ");
     io::stderr().flush()?;
     let mut answer = String::new();
-    io::stdin().read_line(&mut answer)?;
+    input.read_line(&mut answer)?;
     if confirmed(&answer) {
         Ok(())
     } else {
@@ -1573,9 +1577,15 @@ fn run_api(args: ApiArgs, paths: &AppPaths, overrides: Overrides) -> Result<(), 
     let config = load_config_with_override(paths, overrides)?;
     let client = client_for_config(&config)?;
     let body = args.data.as_deref().map(parse_json_data).transpose()?;
-    let bytes = api_passthrough(&client, args.method, &args.path, args.query, body, args.all)?;
-    io::stdout().write_all(&bytes)?;
-    Ok(())
+    api_passthrough(
+        &client,
+        args.method,
+        &args.path,
+        args.query,
+        body,
+        args.all,
+        &mut io::stdout().lock(),
+    )
 }
 
 fn parse_json_data(data: &str) -> Result<Value, AppError> {
@@ -1717,16 +1727,13 @@ fn login_envelope(
 ) -> Result<OutputEnvelope, AppError> {
     let login = resolve_login_args(args)?;
     let config = init_connection(
-        |config| {
-            let timeout = timeout.or(config.timeout);
-            ReqwestTransport::new(AppConfig { timeout, ..config }).map(ApiClient::new)
-        },
+        |config| ReqwestTransport::new(config).map(ApiClient::new),
         paths,
         &login.url,
         login.token,
-        login.username,
-        login.password,
+        login.username.zip(login.password),
         output,
+        timeout,
     )?;
     let findings = auditor.review_once(&audit_state(paths, Some(&config), None));
     Ok(OutputEnvelope {
@@ -1874,7 +1881,16 @@ fn ensure_interactive() -> Result<(), AppError> {
 
 #[cfg(test)]
 mod tests {
-    use super::confirmed;
+    use super::{confirm_empty_trash, confirmed};
+
+    #[test]
+    fn confirm_empty_trash_proceeds_only_on_yes_from_a_terminal() {
+        assert!(confirm_empty_trash(&[2], true, &mut "y\n".as_bytes()).is_ok());
+        let refused = confirm_empty_trash(&[2], true, &mut "n\n".as_bytes()).unwrap_err();
+        assert!(refused.to_string().contains("Nothing was deleted"));
+        let piped = confirm_empty_trash(&[2], false, &mut "y\n".as_bytes()).unwrap_err();
+        assert!(piped.to_string().contains("--yes"));
+    }
 
     #[test]
     fn confirmed_accepts_only_yes() {

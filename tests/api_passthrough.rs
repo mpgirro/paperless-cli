@@ -317,3 +317,46 @@ fn all_refuses_a_cross_host_next_link() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("cross-origin"));
 }
+
+#[test]
+fn a_binary_get_streams_past_the_timeout_while_data_keeps_flowing() {
+    use std::io::{Read, Write};
+    use std::time::Duration;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = stream.read(&mut buf).unwrap();
+            request.extend_from_slice(&buf[..read]);
+        }
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\n%PDF")
+            .unwrap();
+        for _ in 0..4 {
+            std::thread::sleep(Duration::from_millis(400));
+            stream.write_all(b"x").unwrap();
+        }
+    });
+    let dir = tempdir().unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_paperless"))
+        .env("PAPERLESS_CONFIG_PATH", dir.path().join("config.toml"))
+        .env("PAPERLESS_SESSION_PATH", dir.path().join("session.toml"))
+        .env("PAPERLESS_URL", format!("http://127.0.0.1:{port}"))
+        .env("PAPERLESS_TOKEN", TOKEN)
+        .args(["--timeout", "1", "api", "GET", "documents/1/download/"])
+        .output()
+        .unwrap();
+
+    server.join().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"%PDFxxxx");
+}

@@ -32,6 +32,14 @@ pub struct AppConfig {
 
 pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
+/// `None` means the default, `0` means no timeout.
+pub fn timeout_duration(secs: Option<u64>) -> Option<Duration> {
+    match secs.unwrap_or(DEFAULT_TIMEOUT_SECS) {
+        0 => None,
+        secs => Some(Duration::from_secs(secs)),
+    }
+}
+
 impl fmt::Debug for AppConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -65,10 +73,7 @@ impl AppConfig {
     }
 
     pub fn http_timeout(&self) -> Option<Duration> {
-        match self.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS) {
-            0 => None,
-            secs => Some(Duration::from_secs(secs)),
-        }
+        timeout_duration(self.timeout)
     }
 
     pub fn api_url(&self, path: &str) -> String {

@@ -444,3 +444,23 @@ fn failure_reports_the_operations_already_applied() {
         "{stderr}"
     );
 }
+
+#[test]
+fn a_redirected_bulk_edit_fails_instead_of_turning_into_a_get() {
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(POST).path("/api/documents/bulk_edit/");
+        then.status(302)
+            .header("location", "/api/documents/bulk_edit/");
+    });
+    let get = server.mock(|when, then| {
+        when.method(httpmock::Method::GET)
+            .path("/api/documents/bulk_edit/");
+        ok(then);
+    });
+
+    let output = run_bulk(Some(&server), &["1", "--add-tag", "5"], None);
+
+    assert!(!output.status.success());
+    get.assert_calls(0);
+}
