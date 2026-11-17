@@ -224,7 +224,8 @@ impl ReqwestTransport {
                 .unwrap_or_default();
             if idle >= timeout {
                 return Err(AppError::Message(format!(
-                    "Upload timed out: no progress for {} seconds.",
+                    "Upload timed out: no progress for {} seconds. The server may still have \
+                     received it; check before retrying.",
                     timeout.as_secs()
                 )));
             }
@@ -315,6 +316,7 @@ pub fn fetch_token(
     let client = reqwest::blocking::Client::builder()
         .timeout(timeout)
         .connect_timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
         .build()?;
     let url = format!("{}/api/token/", base_url.trim_end_matches('/'));
     let response = client

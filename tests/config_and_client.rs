@@ -673,9 +673,7 @@ fn reqwest_upload_fails_when_the_server_stalls() {
     assert!(started.elapsed() < Duration::from_secs(10));
 }
 
-#[test]
-fn download_never_touches_a_file_at_the_old_part_name() {
-    let server = MockServer::start();
+fn download_client(server: &MockServer) -> ApiClient<ReqwestTransport> {
     server.mock(|when, then| {
         when.method(GET).path("/api/documents/5/download/");
         then.status(200)
@@ -686,18 +684,35 @@ fn download_never_touches_a_file_at_the_old_part_name() {
         when.method(POST).path("/api/documents/bulk_download/");
         then.status(404).body("{}");
     });
+    let config = AppConfig::new(server.base_url(), "token", OutputMode::Json).unwrap();
+    ApiClient::new(ReqwestTransport::new(config).unwrap())
+}
+
+#[test]
+fn zip_export_never_touches_a_file_at_the_old_part_name() {
+    let server = MockServer::start();
+    let client = download_client(&server);
+    let temp = tempdir().unwrap();
+    let zip_part = temp.path().join("out.zip.part");
+    std::fs::write(&zip_part, "keep").unwrap();
+
+    services::bulk_download_zip(&client, &[5], &temp.path().join("out.zip"), "both").unwrap_err();
+
+    assert_eq!(std::fs::read(&zip_part).unwrap(), b"keep");
+}
+
+#[cfg(unix)]
+#[test]
+fn download_never_follows_a_symlink_at_the_old_part_name() {
+    let server = MockServer::start();
+    let client = download_client(&server);
     let temp = tempdir().unwrap();
     let victim = temp.path().join("victim");
     std::fs::write(&victim, "keep").unwrap();
     let part = temp.path().join(".document_5_download.part");
     std::os::unix::fs::symlink(&victim, &part).unwrap();
-    let zip_part = temp.path().join("out.zip.part");
-    std::fs::write(&zip_part, "keep").unwrap();
-    let config = AppConfig::new(server.base_url(), "token", OutputMode::Json).unwrap();
-    let client = ApiClient::new(ReqwestTransport::new(config).unwrap());
 
     let saved = services::download_document(&client, 5, temp.path(), false).unwrap();
-    services::bulk_download_zip(&client, &[5], &temp.path().join("out.zip"), "both").unwrap_err();
 
     assert_eq!(std::fs::read(saved).unwrap(), b"new");
     assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
@@ -705,7 +720,6 @@ fn download_never_touches_a_file_at_the_old_part_name() {
         .unwrap()
         .file_type()
         .is_symlink());
-    assert_eq!(std::fs::read(&zip_part).unwrap(), b"keep");
 }
 
 #[test]

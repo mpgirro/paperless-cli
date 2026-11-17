@@ -360,3 +360,57 @@ fn a_binary_get_streams_past_the_timeout_while_data_keeps_flowing() {
     );
     assert_eq!(output.stdout, b"%PDFxxxx");
 }
+
+#[test]
+fn a_binary_body_reaches_stdout_before_the_response_ends() {
+    use std::io::{Read, Write};
+    use std::process::Stdio;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (go, wait) = mpsc::channel::<()>();
+    let rest_sent = Arc::new(AtomicBool::new(false));
+    let flag = rest_sent.clone();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = stream.read(&mut buf).unwrap();
+            request.extend_from_slice(&buf[..read]);
+        }
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\n%PDF")
+            .unwrap();
+        let _ = wait.recv_timeout(Duration::from_secs(5));
+        flag.store(true, Ordering::SeqCst);
+        stream.write_all(b"rest").unwrap();
+    });
+    let dir = tempdir().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_paperless"))
+        .env("PAPERLESS_CONFIG_PATH", dir.path().join("config.toml"))
+        .env("PAPERLESS_SESSION_PATH", dir.path().join("session.toml"))
+        .env("PAPERLESS_URL", format!("http://127.0.0.1:{port}"))
+        .env("PAPERLESS_TOKEN", TOKEN)
+        .args(["api", "GET", "documents/1/download/"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let mut stdout = child.stdout.take().unwrap();
+    let mut head = [0u8; 4];
+    stdout.read_exact(&mut head).unwrap();
+    let streamed = !rest_sent.load(Ordering::SeqCst);
+    go.send(()).unwrap();
+    let mut tail = Vec::new();
+    stdout.read_to_end(&mut tail).unwrap();
+    assert!(child.wait().unwrap().success());
+    server.join().unwrap();
+
+    assert!(streamed, "stdout waited for the whole body");
+    assert_eq!(&head, b"%PDF");
+    assert_eq!(tail, b"rest");
+}

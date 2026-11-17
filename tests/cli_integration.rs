@@ -902,3 +902,37 @@ fn login_with_password_honours_the_timeout_flag() {
     assert!(!output.status.success());
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
 }
+
+#[test]
+fn login_does_not_follow_a_redirect_with_the_credentials() {
+    let target = MockServer::start();
+    let leaked = target.mock(|when, then| {
+        when.any_request();
+        then.status(200).body(r#"{"token":"stolen"}"#);
+    });
+    let server = MockServer::start();
+    let location = target.url("/api/token/");
+    server.mock(|when, then| {
+        when.method(POST).path("/api/token/");
+        then.status(307).header("location", location.as_str());
+    });
+    let (_dir, config, session) = base_env();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_paperless"))
+        .env("PAPERLESS_CONFIG_PATH", &config)
+        .env("PAPERLESS_SESSION_PATH", &session)
+        .args([
+            "login",
+            "--url",
+            &server.base_url(),
+            "--username",
+            "admin",
+            "--password",
+            "secret",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    leaked.assert_calls(0);
+}
