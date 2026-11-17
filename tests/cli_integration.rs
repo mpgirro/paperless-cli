@@ -870,3 +870,35 @@ fn document_update_rejects_value_and_clear_flag_together() {
     }
     any.assert_calls(0);
 }
+
+#[test]
+fn login_with_password_honours_the_timeout_flag() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        let (_stream, _) = listener.accept().unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(30));
+    });
+    let (_dir, config, session) = base_env();
+
+    let started = std::time::Instant::now();
+    let output = Command::new(env!("CARGO_BIN_EXE_paperless"))
+        .env("PAPERLESS_CONFIG_PATH", &config)
+        .env("PAPERLESS_SESSION_PATH", &session)
+        .args([
+            "--timeout",
+            "1",
+            "login",
+            "--url",
+            &url,
+            "--username",
+            "admin",
+            "--password",
+            "secret",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+}
